@@ -11,20 +11,20 @@ class OddsAPIProvider:
         self.api_key = api_key
         self.region = region
         self.timeout = timeout
+        self.last_fetch_meta = {}
 
     @classmethod
-    def _scan_window_utc(cls):
-        """UTC boundaries covering today and tomorrow in Dutch local time."""
-        now_local = datetime.now(cls.SCAN_TZ)
-        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_local = start_local + timedelta(days=2)
-        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+    def _scan_dates(cls):
+        today = datetime.now(cls.SCAN_TZ).date()
+        return today, today + timedelta(days=1)
 
     def fetch_odds(self, sport_key: str, markets: list[str]):
-        """Fetch normal odds payload, then strictly keep fixtures from today/tomorrow.
+        """Fetch odds and keep only fixtures whose Amsterdam calendar date is today/tomorrow.
 
-        Filtering locally avoids relying on optional API query parameters while still
-        guaranteeing that later fixtures never reach signal generation.
+        Comparing local calendar dates is deliberately simpler and safer than UTC
+        midnight arithmetic: the API timestamps are UTC while the product promise is
+        explicitly based on Dutch dates. This is DST-safe and prevents next-week games
+        entering signal generation without depending on optional provider query params.
         """
         url = f'{self.BASE}/sports/{sport_key}/odds'
         params = {
@@ -36,41 +36,53 @@ class OddsAPIProvider:
         }
         r = requests.get(url, params=params, timeout=self.timeout)
         r.raise_for_status()
-        events = r.json()
+        payload = r.json()
+        events = payload if isinstance(payload, list) else []
 
-        start_utc, end_utc = self._scan_window_utc()
+        today, tomorrow = self._scan_dates()
         filtered = []
+        invalid_times = 0
         for event in events:
             raw_time = event.get('commence_time')
             if not raw_time:
+                invalid_times += 1
                 continue
             try:
-                commence = datetime.fromisoformat(raw_time.replace('Z', '+00:00'))
+                commence = datetime.fromisoformat(str(raw_time).replace('Z', '+00:00'))
                 if commence.tzinfo is None:
                     commence = commence.replace(tzinfo=timezone.utc)
-                commence = commence.astimezone(timezone.utc)
-            except (TypeError, ValueError):
+                local_date = commence.astimezone(self.SCAN_TZ).date()
+            except (TypeError, ValueError, OverflowError):
+                invalid_times += 1
                 continue
-            if start_utc <= commence < end_utc:
+            if local_date == today or local_date == tomorrow:
                 filtered.append(event)
 
+        self.last_fetch_meta = {
+            'sport_key': sport_key,
+            'raw_events': len(events),
+            'eligible_events': len(filtered),
+            'filtered_events': max(0, len(events) - len(filtered)),
+            'invalid_times': invalid_times,
+            'window_today': today.isoformat(),
+            'window_tomorrow': tomorrow.isoformat(),
+        }
         return filtered, {
             'remaining': r.headers.get('x-requests-remaining'),
             'used': r.headers.get('x-requests-used'),
             'last': r.headers.get('x-requests-last'),
+            **self.last_fetch_meta,
         }
 
     def fetch_scores(self, sport_key: str, days_from: int = 3):
         url = f'{self.BASE}/sports/{sport_key}/scores'
         r = requests.get(url, params={'apiKey': self.api_key, 'daysFrom': max(1, min(3, int(days_from))), 'dateFormat': 'iso'}, timeout=self.timeout)
         r.raise_for_status()
-        return r.json()
+        payload = r.json()
+        return payload if isinstance(payload, list) else []
 
     def fetch_score_history(self, sport_key: str, windows: int = 1):
-        """Fetch the deepest score window supported by the live API without pretending it is historical data."""
         merged = {}
-        # Scores endpoint currently exposes only a short recent window. Keep this helper explicit
-        # so a future historical provider can be plugged in without contaminating model code.
         for _ in range(max(1, windows)):
             for event in self.fetch_scores(sport_key, days_from=3):
                 if event.get('id'):
@@ -83,9 +95,37 @@ class OddsAPIProvider:
         now = datetime.now(timezone.utc)
         rows = []
         for event in events:
-            commence = datetime.fromisoformat(event['commence_time'].replace('Z', '+00:00'))
-            for book in event.get('bookmakers', []):
-                for market in book.get('markets', []):
-                    for out in market.get('outcomes', []):
-                        rows.append({'event_id': event['id'], 'sport_key': event['sport_key'], 'commence_time': commence, 'home_team': event['home_team'], 'away_team': event['away_team'], 'market': market['key'], 'bookmaker': book['key'], 'outcome': out['name'], 'price': float(out['price']), 'point': out.get('point'), 'observed_at': now})
+            raw_time = event.get('commence_time')
+            if not raw_time:
+                continue
+            try:
+                commence = datetime.fromisoformat(str(raw_time).replace('Z', '+00:00'))
+                if commence.tzinfo is None:
+                    commence = commence.replace(tzinfo=timezone.utc)
+                commence = commence.astimezone(timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            event_id = event.get('id')
+            sport_key = event.get('sport_key')
+            home = event.get('home_team')
+            away = event.get('away_team')
+            if not all((event_id, sport_key, home, away)):
+                continue
+            for book in event.get('bookmakers') or []:
+                book_key = book.get('key')
+                if not book_key:
+                    continue
+                for market in book.get('markets') or []:
+                    market_key = market.get('key')
+                    if not market_key:
+                        continue
+                    for out in market.get('outcomes') or []:
+                        try:
+                            price = float(out['price'])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        outcome = out.get('name')
+                        if not outcome or price <= 1.0:
+                            continue
+                        rows.append({'event_id': event_id, 'sport_key': sport_key, 'commence_time': commence, 'home_team': home, 'away_team': away, 'market': market_key, 'bookmaker': book_key, 'outcome': outcome, 'price': price, 'point': out.get('point'), 'observed_at': now})
         return rows
