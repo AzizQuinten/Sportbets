@@ -42,7 +42,12 @@ def latest_successful_scan(db: Session) -> ScanRun | None:
 
 
 def recommended_scan_interval_minutes(db: Session) -> int:
-    """Choose a conservative scan cadence from quota and time to next kickoff."""
+    """Choose a scan cadence from time-to-kickoff while protecting small API plans.
+
+    The scheduler wakes every POLL_MINUTES, but a real API call only happens when
+    this adaptive interval has elapsed. A ~500-credit plan is therefore kept near
+    a sustainable three-hour baseline instead of being exhausted in a day.
+    """
     now = _utcnow()
     next_kickoff = db.scalar(
         select(func.min(OddsSnapshot.commence_time)).where(OddsSnapshot.commence_time > now)
@@ -65,13 +70,13 @@ def recommended_scan_interval_minutes(db: Session) -> int:
     remaining = last.quota_remaining if last else None
     if remaining is not None:
         if remaining <= settings.api_quota_floor:
-            minutes = max(minutes, 360)
+            minutes = max(minutes, 720)
         elif remaining < 100:
-            minutes = max(minutes, 180)
+            minutes = max(minutes, 360)
         elif remaining < 250:
-            minutes = max(minutes, 120)
+            minutes = max(minutes, 240)
         elif remaining < 500:
-            minutes = max(minutes, 60)
+            minutes = max(minutes, 180)
 
     return max(settings.poll_minutes, minutes)
 
