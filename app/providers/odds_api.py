@@ -52,23 +52,37 @@ class OddsAPIProvider:
             raise RuntimeError(f'Odds API returned non-JSON HTTP {r.status_code}') from exc
 
     def fetch_active_sports(self):
-        """Quota-free provider catalogue. Only active soccer competitions are returned."""
-        _, payload, _ = self._get(f'{self.BASE}/sports/', {'apiKey': self.api_key})
+        """Return the FULL supported soccer catalogue.
+
+        Critical: /sports without all=true only returns in-season/recently updated
+        competitions. That silently hid valid leagues from fixture discovery. The
+        catalogue endpoint is quota-free, so discover every soccer key and let the
+        quota-free /events preflight decide which leagues actually have a fixture
+        today/tomorrow.
+        """
+        _, payload, _ = self._get(
+            f'{self.BASE}/sports/',
+            {'apiKey': self.api_key, 'all': 'true'},
+        )
         if not isinstance(payload, list):
             raise RuntimeError(f'Unexpected sports payload: {type(payload).__name__}')
         return [
             x for x in payload
-            if x.get('active') is not False
-            and (str(x.get('key', '')).startswith('soccer_') or str(x.get('group', '')).lower().startswith('soccer'))
+            if (str(x.get('key', '')).startswith('soccer_') or str(x.get('group', '')).lower().startswith('soccer'))
             and not x.get('has_outrights', False)
         ]
 
     def fetch_events(self, sport_key: str):
-        """Quota-free fixture preflight for one competition, filtered to today + tomorrow."""
+        """Quota-free fixture preflight, hard limited to Amsterdam today+tomorrow."""
         window_start, window_end = self._scan_window()
         r, payload, _ = self._get(
             f'{self.BASE}/sports/{sport_key}/events',
-            {'apiKey': self.api_key, 'dateFormat': 'iso'},
+            {
+                'apiKey': self.api_key,
+                'dateFormat': 'iso',
+                'commenceTimeFrom': self._iso_utc(window_start),
+                'commenceTimeTo': self._iso_utc(window_end),
+            },
         )
         if not isinstance(payload, list):
             raise RuntimeError(f'Unexpected events payload for {sport_key}: {type(payload).__name__}')
@@ -96,7 +110,6 @@ class OddsAPIProvider:
         }
 
     def fetch_odds(self, sport_key: str, markets: list[str]):
-        """Fetch paid odds only after quota-free fixture preflight found a relevant game."""
         window_start, window_end = self._scan_window()
         url = f'{self.BASE}/sports/{sport_key}/odds/'
         params = {
@@ -137,21 +150,14 @@ class OddsAPIProvider:
         eligible_markets = sum(len(b.get('markets') or []) for e in filtered for b in (e.get('bookmakers') or []))
         eligible_outcomes = sum(len(m.get('outcomes') or []) for e in filtered for b in (e.get('bookmakers') or []) for m in (b.get('markets') or []))
         meta = {
-            'sport_key': sport_key,
-            'http_status': r.status_code,
-            'raw_events': len(payload),
-            'eligible_events': len(filtered),
-            'past_events': past_events,
-            'beyond_window': beyond_window,
-            'invalid_times': invalid_times,
-            'raw_bookmakers': raw_books,
-            'raw_markets': raw_markets,
-            'raw_outcomes': raw_outcomes,
-            'eligible_bookmakers': eligible_books,
-            'eligible_markets': eligible_markets,
+            'sport_key': sport_key, 'http_status': r.status_code,
+            'raw_events': len(payload), 'eligible_events': len(filtered),
+            'past_events': past_events, 'beyond_window': beyond_window,
+            'invalid_times': invalid_times, 'raw_bookmakers': raw_books,
+            'raw_markets': raw_markets, 'raw_outcomes': raw_outcomes,
+            'eligible_bookmakers': eligible_books, 'eligible_markets': eligible_markets,
             'eligible_outcomes': eligible_outcomes,
-            'window_from': self._iso_utc(window_start),
-            'window_to': self._iso_utc(window_end),
+            'window_from': self._iso_utc(window_start), 'window_to': self._iso_utc(window_end),
         }
         self.last_fetch_meta = meta
         return filtered, {**quota, **meta}
