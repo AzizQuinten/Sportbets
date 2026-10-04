@@ -38,11 +38,6 @@ def _rating(db: Session, sport_key: str, team: str) -> TeamRating:
 
 
 def ingest_completed_scores(db: Session, sport_key: str, scores: list[dict]) -> int:
-    """Persist unseen results and update ratings chronologically.
-
-    This model never fabricates historical knowledge. It starts close to neutral and
-    earns influence as real completed matches are observed by the bot.
-    """
     completed = [x for x in scores if x.get('completed') and x.get('scores')]
     completed.sort(key=lambda x: _parse_time(x.get('commence_time')))
     inserted = 0
@@ -181,12 +176,22 @@ def external_probability(db: Session, event: dict, outcome: str, market_fair_pro
 
     weight = settings.max_model_weight * reliability
     raw = probs[outcome]
-    blended = (1.0 - weight) * market_fair_prob + weight * raw
+    market_gap = raw - market_fair_prob
+    unbounded = (1.0 - weight) * market_fair_prob + weight * raw
+    shift = unbounded - market_fair_prob
+    bounded_shift = _clamp(shift, -settings.max_blended_model_shift, settings.max_blended_model_shift)
+    blended = market_fair_prob + bounded_shift
+
     return _clamp(blended, 0.01, 0.99), {
         **meta,
         'raw_model_prob': raw,
         'market_anchor_prob': market_fair_prob,
         'model_weight': weight,
+        'market_gap': market_gap,
+        'unbounded_blended_prob': unbounded,
+        'blended_shift': bounded_shift,
+        'shift_capped': abs(shift - bounded_shift) > 1e-12,
+        'market_disagreement': abs(market_gap) > settings.max_model_market_gap,
     }
 
 
@@ -205,4 +210,10 @@ def model_summary(db: Session) -> dict:
         'max_model_weight': settings.max_model_weight,
         'full_strength_games': settings.model_full_strength_games,
         'status': 'LEARNING' if results < 40 or mature == 0 else 'ACTIVE',
+        'guardrails': {
+            'min_reliability_for_paper': settings.min_model_reliability_for_paper,
+            'max_market_gap': settings.max_model_market_gap,
+            'max_blended_shift': settings.max_blended_model_shift,
+            'max_paper_ev': settings.max_paper_ev,
+        },
     }
