@@ -15,29 +15,27 @@ class OddsAPIProvider:
 
     @classmethod
     def _scan_window(cls):
-        """Return UTC instants covering today + tomorrow in Amsterdam time."""
+        """Upcoming remainder of today + all of tomorrow, Amsterdam local time."""
         now_local = datetime.now(cls.SCAN_TZ)
-        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_local = start_local + timedelta(days=2)
-        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+        end_local = (now_local + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
+        return now_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+    @staticmethod
+    def _iso_utc(dt: datetime) -> str:
+        # The Odds API expects RFC3339 UTC timestamps. Keep second precision.
+        return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     def fetch_odds(self, sport_key: str, markets: list[str]):
-        """Fetch only fixtures from today and tomorrow (Europe/Amsterdam).
-
-        The date bounds are sent to The Odds API as UTC timestamps so next-week
-        fixtures are not downloaded and then discarded locally. A defensive local
-        check remains in place for provider boundary quirks/DST.
-        """
         window_start, window_end = self._scan_window()
-        url = f'{self.BASE}/sports/{sport_key}/odds'
+        url = f'{self.BASE}/sports/{sport_key}/odds/'
         params = {
             'apiKey': self.api_key,
             'regions': self.region,
             'markets': ','.join(markets),
             'oddsFormat': 'decimal',
             'dateFormat': 'iso',
-            'commenceTimeFrom': window_start.isoformat().replace('+00:00', 'Z'),
-            'commenceTimeTo': window_end.isoformat().replace('+00:00', 'Z'),
+            'commenceTimeFrom': self._iso_utc(window_start),
+            'commenceTimeTo': self._iso_utc(window_end),
         }
         r = requests.get(url, params=params, timeout=self.timeout)
         r.raise_for_status()
@@ -59,17 +57,18 @@ class OddsAPIProvider:
             except (TypeError, ValueError, OverflowError):
                 invalid_times += 1
                 continue
-            if window_start <= commence < window_end:
+            if window_start <= commence <= window_end:
                 filtered.append(event)
 
         self.last_fetch_meta = {
             'sport_key': sport_key,
+            'http_status': r.status_code,
             'raw_events': len(events),
             'eligible_events': len(filtered),
             'filtered_events': max(0, len(events) - len(filtered)),
             'invalid_times': invalid_times,
-            'window_from': window_start.isoformat(),
-            'window_to': window_end.isoformat(),
+            'window_from': self._iso_utc(window_start),
+            'window_to': self._iso_utc(window_end),
         }
         return filtered, {
             'remaining': r.headers.get('x-requests-remaining'),
@@ -79,7 +78,7 @@ class OddsAPIProvider:
         }
 
     def fetch_scores(self, sport_key: str, days_from: int = 3):
-        url = f'{self.BASE}/sports/{sport_key}/scores'
+        url = f'{self.BASE}/sports/{sport_key}/scores/'
         r = requests.get(url, params={'apiKey': self.api_key, 'daysFrom': max(1, min(3, int(days_from))), 'dateFormat': 'iso'}, timeout=self.timeout)
         r.raise_for_status()
         payload = r.json()
