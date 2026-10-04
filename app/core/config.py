@@ -31,16 +31,23 @@ class Settings(BaseSettings):
     snapshot_retention_days: int = 30
     signal_retention_days: int = 30
 
-    # V1.2 model intelligence. The independent model starts with low influence
-    # and earns more weight only as completed matches accumulate.
+    # V1.2+ model intelligence.
     max_model_weight: float = 0.40
     elo_home_advantage: float = 55.0
     elo_k_factor: float = 24.0
     model_full_strength_games: int = 10
     model_refresh_hours: int = 12
 
-    # V1.4 historical bootstrap. Public-domain historical results are used only
-    # for competitions that have an explicit provider mapping.
+    # V1.5 calibration/risk guardrails. The historical model is useful but is
+    # not assumed to be perfectly calibrated. Extreme model/market disagreement
+    # is researched in shadow mode rather than trusted with a paper stake.
+    min_model_reliability_for_paper: float = 0.75
+    max_model_market_gap: float = 0.20
+    max_blended_model_shift: float = 0.06
+    max_paper_ev: float = 0.30
+    one_pick_per_event_market: bool = True
+
+    # V1.4 historical bootstrap.
     historical_bootstrap_enabled: bool = True
     historical_bootstrap_seasons: int = 2
 

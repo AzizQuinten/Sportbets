@@ -22,7 +22,7 @@ from app.services.model import ingest_completed_scores, model_summary
 
 router = APIRouter()
 settings = get_settings()
-APP_VERSION = '1.4.0'
+APP_VERSION = '1.5.0'
 
 
 def _scan_dict(x: ScanRun | None):
@@ -204,6 +204,11 @@ def engine_status(db: Session = Depends(get_db)):
             'max_daily_exposure_pct': settings.max_daily_exposure_pct,
             'paper_only': settings.paper_only,
             'max_model_weight': settings.max_model_weight,
+            'min_model_reliability_for_paper': settings.min_model_reliability_for_paper,
+            'max_model_market_gap': settings.max_model_market_gap,
+            'max_blended_model_shift': settings.max_blended_model_shift,
+            'max_paper_ev': settings.max_paper_ev,
+            'one_pick_per_event_market': settings.one_pick_per_event_market,
             'shadow_min_edge': settings.shadow_min_edge,
             'shadow_min_ev': settings.shadow_min_ev,
         },
@@ -235,12 +240,18 @@ def analytics(db: Session = Depends(get_db)):
     vigs = []
     outliers = []
     model_reliabilities = []
+    model_gaps = []
+    shift_caps = 0
     for s in rows:
         sport_counts[s.sport_key] += 1
         book_counts.append(s.books)
         vigs.append(s.market_vig)
         mm = (s.meta or {}).get('model') or {}
         model_reliabilities.append(float(mm.get('reliability') or 0.0))
+        if mm.get('market_gap') is not None:
+            model_gaps.append(abs(float(mm.get('market_gap') or 0.0)))
+        if mm.get('shift_capped'):
+            shift_caps += 1
         outliers.append(int((s.meta or {}).get('outlier_books') or 0))
         if not s.accepted and s.reject_reason:
             rejects.update(x for x in s.reject_reason.split(',') if x)
@@ -289,6 +300,8 @@ def analytics(db: Session = Depends(get_db)):
             'avg_books': sum(book_counts) / len(book_counts) if book_counts else 0.0,
             'avg_vig': sum(vigs) / len(vigs) if vigs else 0.0,
             'avg_model_reliability': sum(model_reliabilities) / len(model_reliabilities) if model_reliabilities else 0.0,
+            'avg_abs_model_market_gap': sum(model_gaps) / len(model_gaps) if model_gaps else 0.0,
+            'model_shift_caps': shift_caps,
             'outlier_quotes_removed': sum(outliers),
             'sports': dict(sport_counts),
             'signals': len(rows),
