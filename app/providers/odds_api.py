@@ -14,18 +14,21 @@ class OddsAPIProvider:
         self.last_fetch_meta = {}
 
     @classmethod
-    def _scan_dates(cls):
-        today = datetime.now(cls.SCAN_TZ).date()
-        return today, today + timedelta(days=1)
+    def _scan_window(cls):
+        """Return UTC instants covering today + tomorrow in Amsterdam time."""
+        now_local = datetime.now(cls.SCAN_TZ)
+        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_local = start_local + timedelta(days=2)
+        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
     def fetch_odds(self, sport_key: str, markets: list[str]):
-        """Fetch odds and keep only fixtures whose Amsterdam calendar date is today/tomorrow.
+        """Fetch only fixtures from today and tomorrow (Europe/Amsterdam).
 
-        Comparing local calendar dates is deliberately simpler and safer than UTC
-        midnight arithmetic: the API timestamps are UTC while the product promise is
-        explicitly based on Dutch dates. This is DST-safe and prevents next-week games
-        entering signal generation without depending on optional provider query params.
+        The date bounds are sent to The Odds API as UTC timestamps so next-week
+        fixtures are not downloaded and then discarded locally. A defensive local
+        check remains in place for provider boundary quirks/DST.
         """
+        window_start, window_end = self._scan_window()
         url = f'{self.BASE}/sports/{sport_key}/odds'
         params = {
             'apiKey': self.api_key,
@@ -33,13 +36,14 @@ class OddsAPIProvider:
             'markets': ','.join(markets),
             'oddsFormat': 'decimal',
             'dateFormat': 'iso',
+            'commenceTimeFrom': window_start.isoformat().replace('+00:00', 'Z'),
+            'commenceTimeTo': window_end.isoformat().replace('+00:00', 'Z'),
         }
         r = requests.get(url, params=params, timeout=self.timeout)
         r.raise_for_status()
         payload = r.json()
         events = payload if isinstance(payload, list) else []
 
-        today, tomorrow = self._scan_dates()
         filtered = []
         invalid_times = 0
         for event in events:
@@ -51,11 +55,11 @@ class OddsAPIProvider:
                 commence = datetime.fromisoformat(str(raw_time).replace('Z', '+00:00'))
                 if commence.tzinfo is None:
                     commence = commence.replace(tzinfo=timezone.utc)
-                local_date = commence.astimezone(self.SCAN_TZ).date()
+                commence = commence.astimezone(timezone.utc)
             except (TypeError, ValueError, OverflowError):
                 invalid_times += 1
                 continue
-            if local_date == today or local_date == tomorrow:
+            if window_start <= commence < window_end:
                 filtered.append(event)
 
         self.last_fetch_meta = {
@@ -64,8 +68,8 @@ class OddsAPIProvider:
             'eligible_events': len(filtered),
             'filtered_events': max(0, len(events) - len(filtered)),
             'invalid_times': invalid_times,
-            'window_today': today.isoformat(),
-            'window_tomorrow': tomorrow.isoformat(),
+            'window_from': window_start.isoformat(),
+            'window_to': window_end.isoformat(),
         }
         return filtered, {
             'remaining': r.headers.get('x-requests-remaining'),
