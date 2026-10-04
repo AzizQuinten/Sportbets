@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     model_full_strength_games: int = 10
     model_refresh_hours: int = 12
 
+    # V1.4 historical bootstrap. Public-domain historical results are used only
+    # for competitions that have an explicit provider mapping.
+    historical_bootstrap_enabled: bool = True
+    historical_bootstrap_seasons: int = 2
+
     # Shadow tier: track plausible near-misses without risking bankroll.
     shadow_min_bookmakers: int = 3
     shadow_min_edge: float = 0.005
