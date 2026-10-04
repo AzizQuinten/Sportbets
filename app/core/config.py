@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     max_odds_age_seconds: int = 600
     poll_minutes: int = 5
 
+    # V1.1 engine controls. The scheduler wakes frequently, but actual API scans
+    # are quota-aware and adaptive so a small API plan is not burned in hours.
+    auto_scan_enabled: bool = True
+    auto_settle_enabled: bool = True
+    api_quota_floor: int = 40
+    snapshot_retention_days: int = 30
+    signal_retention_days: int = 30
+
     @property
     def sports(self):
         return [x.strip() for x in self.sport_keys.split(',') if x.strip()]
