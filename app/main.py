@@ -10,7 +10,7 @@ from app.core.db import Base, engine
 from app.api.routes import router
 from app.services.cycle import auto_scan_tick, settle_if_needed, refresh_model_tick, bootstrap_model_tick
 
-APP_VERSION = '1.9.0'
+APP_VERSION = '2.0.0'
 settings = get_settings()
 BASE = Path(__file__).resolve().parent
 app = FastAPI(title=settings.app_name, version=APP_VERSION)
