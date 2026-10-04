@@ -1,0 +1,62 @@
+from datetime import datetime, timezone
+import requests
+
+
+class OddsAPIProvider:
+    BASE = 'https://api.the-odds-api.com/v4'
+
+    def __init__(self, api_key: str, region: str = 'eu', timeout: int = 20):
+        self.api_key = api_key
+        self.region = region
+        self.timeout = timeout
+
+    def fetch_odds(self, sport_key: str, markets: list[str]):
+        url = f'{self.BASE}/sports/{sport_key}/odds'
+        params = {
+            'apiKey': self.api_key,
+            'regions': self.region,
+            'markets': ','.join(markets),
+            'oddsFormat': 'decimal',
+            'dateFormat': 'iso',
+        }
+        r = requests.get(url, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json(), {
+            'remaining': r.headers.get('x-requests-remaining'),
+            'used': r.headers.get('x-requests-used'),
+            'last': r.headers.get('x-requests-last'),
+        }
+
+    def fetch_scores(self, sport_key: str, days_from: int = 3):
+        url = f'{self.BASE}/sports/{sport_key}/scores'
+        r = requests.get(url, params={
+            'apiKey': self.api_key,
+            'daysFrom': days_from,
+            'dateFormat': 'iso',
+        }, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    @staticmethod
+    def flatten(events: list[dict]):
+        now = datetime.now(timezone.utc)
+        rows = []
+        for event in events:
+            commence = datetime.fromisoformat(event['commence_time'].replace('Z', '+00:00'))
+            for book in event.get('bookmakers', []):
+                for market in book.get('markets', []):
+                    for out in market.get('outcomes', []):
+                        rows.append({
+                            'event_id': event['id'],
+                            'sport_key': event['sport_key'],
+                            'commence_time': commence,
+                            'home_team': event['home_team'],
+                            'away_team': event['away_team'],
+                            'market': market['key'],
+                            'bookmaker': book['key'],
+                            'outcome': out['name'],
+                            'price': float(out['price']),
+                            'point': out.get('point'),
+                            'observed_at': now,
+                        })
+        return rows
