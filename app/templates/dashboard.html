@@ -13,7 +13,7 @@
     <div>
       <span class="eyebrow">PAPER EDGE ENGINE · V{{ app_version }}</span>
       <h1>SportBet Edge Lab</h1>
-      <p>Robust market consensus · Elo/Poisson learning · adaptive scans · shadow research · CLV tracking</p>
+      <p>Robust market consensus · Elo/Poisson learning · historical bootstrap · shadow research · CLV tracking</p>
     </div>
     <div class="headerRight">
       <div class="status">PAPER ONLY</div>
@@ -35,7 +35,10 @@
     </div>
 
     <div class="panel">
-      <div class="panelHead"><div><h2>Model lab</h2><p>Independent signal weight grows only with real completed matches.</p></div></div>
+      <div class="panelHead">
+        <div><h2>Model lab</h2><p>Historical public-domain results seed Elo/Poisson; live completed matches keep it current.</p></div>
+        <button class="ghost" id="bootstrapBtn" onclick="bootstrapModel()">Bootstrap model</button>
+      </div>
       <div class="engineGrid" id="modelStats"></div>
       <div class="subtle" id="modelLine"></div>
     </div>
