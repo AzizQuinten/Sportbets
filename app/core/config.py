@@ -9,7 +9,19 @@ class Settings(BaseSettings):
     database_url: str = 'sqlite:///./sportbet.db'
     odds_api_key: str = ''
     odds_region: str = 'eu'
-    sport_keys: str = 'soccer_epl'
+    # V1.6: broad European football coverage. Railway can still override this
+    # with SPORT_KEYS, but a fresh deployment is no longer EPL-only by default.
+    sport_keys: str = (
+        'soccer_epl,'
+        'soccer_uefa_champs_league,'
+        'soccer_uefa_europa_league,'
+        'soccer_uefa_europa_conference_league,'
+        'soccer_spain_la_liga,'
+        'soccer_germany_bundesliga,'
+        'soccer_italy_serie_a,'
+        'soccer_france_ligue_one,'
+        'soccer_netherlands_eredivisie'
+    )
     markets: str = 'h2h'
     bankroll: float = 10000.0
     paper_only: bool = True
