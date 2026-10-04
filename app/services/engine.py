@@ -60,6 +60,15 @@ def build_signals(db: Session, rows: list[dict]) -> list[Signal]:
             if meta['commence_time'] <= datetime.now(timezone.utc):
                 reasons.append('already_started')
 
+            source = model_meta.get('source')
+            reliability = float(model_meta.get('reliability') or 0.0)
+            if source != 'market_only' and reliability < settings.min_model_reliability_for_paper:
+                reasons.append('model_not_mature_enough')
+            if model_meta.get('market_disagreement'):
+                reasons.append('model_market_disagreement')
+            if ev > settings.max_paper_ev:
+                reasons.append('ev_too_extreme')
+
             s = Signal(
                 event_id=event_id,
                 sport_key=meta['sport_key'],
@@ -97,8 +106,24 @@ def place_paper_bets(db: Session, signals: list[Signal]) -> int:
     count = 0
     daily_cap = settings.bankroll * settings.max_daily_exposure_pct
     event_cap = settings.bankroll * settings.max_event_exposure_pct
-    for s in sorted((x for x in signals if x.accepted), key=lambda x: x.ev, reverse=True):
+
+    accepted = sorted((x for x in signals if x.accepted), key=lambda x: (x.ev, x.edge), reverse=True)
+    if settings.one_pick_per_event_market:
+        seen = set()
+        filtered = []
+        for s in accepted:
+            key = (s.event_id, s.market)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(s)
+        accepted = filtered
+
+    for s in accepted:
         exists = db.scalar(select(PaperBet).where(
+            PaperBet.event_id == s.event_id,
+            PaperBet.market == s.market,
+        )) if settings.one_pick_per_event_market else db.scalar(select(PaperBet).where(
             PaperBet.event_id == s.event_id,
             PaperBet.market == s.market,
             PaperBet.outcome == s.outcome,
@@ -143,7 +168,6 @@ def place_paper_bets(db: Session, signals: list[Signal]) -> int:
 
 
 def track_shadow_picks(db: Session, signals: list[Signal]) -> int:
-    """Persist near-miss value candidates for zero-risk threshold research."""
     count = 0
     for s in sorted(signals, key=lambda x: x.ev, reverse=True):
         if s.accepted or s.market != 'h2h':
@@ -182,7 +206,6 @@ def track_shadow_picks(db: Session, signals: list[Signal]) -> int:
 
 
 def update_closing_lines(db: Session, rows: list[dict]) -> int:
-    """Refresh best current line for open paper/shadow picks; last pre-kickoff value becomes CLV reference."""
     best = {}
     now = datetime.now(timezone.utc)
     for r in rows:
