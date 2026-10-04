@@ -71,6 +71,21 @@ class PaperBet(Base):
     result: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
 
+class BetAudit(Base):
+    """Selection metadata stored separately so existing paper_bets schema stays compatible."""
+    __tablename__ = 'bet_audit'
+    __table_args__ = (UniqueConstraint('paper_bet_id', name='uq_bet_audit_paper_bet'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    paper_bet_id: Mapped[int] = mapped_column(Integer, index=True)
+    tier: Mapped[str] = mapped_column(String(20), default='CORE', index=True)
+    selection_score: Mapped[float] = mapped_column(Float, default=0.0)
+    adjusted_ev: Mapped[float] = mapped_column(Float, default=0.0)
+    market_quality: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    reject_snapshot: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class ScanRun(Base):
     __tablename__ = 'scan_runs'
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -93,7 +108,6 @@ class ScanRun(Base):
 
 
 class MatchResult(Base):
-    """Completed fixtures used to train the incremental football model."""
     __tablename__ = 'match_results'
     __table_args__ = (UniqueConstraint('event_id', name='uq_match_result_event'),)
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -108,7 +122,6 @@ class MatchResult(Base):
 
 
 class TeamRating(Base):
-    """Incremental Elo + rolling goal-strength state per competition/team."""
     __tablename__ = 'team_ratings'
     __table_args__ = (UniqueConstraint('sport_key', 'team', name='uq_team_rating'),)
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -125,7 +138,6 @@ class TeamRating(Base):
 
 
 class ShadowPick(Base):
-    """Near-miss candidate tracked with zero bankroll risk for threshold research."""
     __tablename__ = 'shadow_picks'
     __table_args__ = (UniqueConstraint('event_id', 'market', 'outcome', name='uq_shadow_pick'),)
     id: Mapped[int] = mapped_column(primary_key=True)
