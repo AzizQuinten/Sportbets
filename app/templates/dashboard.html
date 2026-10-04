@@ -11,13 +11,14 @@
 <div class="wrap">
   <header>
     <div>
-      <span class="eyebrow">PAPER EDGE ENGINE · V1.1</span>
+      <span class="eyebrow">PAPER EDGE ENGINE · V1.2</span>
       <h1>SportBet Edge Lab</h1>
-      <p>Price-first research · no-vig consensus · smart auto-scan · controlled Kelly · audit trail</p>
+      <p>Robust market consensus · Elo/Poisson learning · adaptive scans · shadow research · CLV tracking</p>
     </div>
     <div class="headerRight">
       <div class="status">PAPER ONLY</div>
       <div class="engineBadge" id="engineBadge">ENGINE …</div>
+      <div class="engineBadge" id="modelBadge">MODEL …</div>
     </div>
   </header>
 
@@ -26,10 +27,7 @@
   <section class="grid split">
     <div class="panel enginePanel">
       <div class="panelHead">
-        <div>
-          <h2>Engine pulse</h2>
-          <p>Automation, quota protection and last-scan telemetry.</p>
-        </div>
+        <div><h2>Engine pulse</h2><p>Automation, quota protection and last-scan telemetry.</p></div>
         <button id="scanBtn" onclick="runCycle()">Run scan</button>
       </div>
       <div class="engineGrid" id="engineStats"></div>
@@ -37,77 +35,52 @@
     </div>
 
     <div class="panel">
-      <div class="panelHead">
-        <div>
-          <h2>Why bets are rejected</h2>
-          <p>Latest scan only. No threshold guessing.</p>
-        </div>
-      </div>
+      <div class="panelHead"><div><h2>Model lab</h2><p>Independent signal weight grows only with real completed matches.</p></div></div>
+      <div class="engineGrid" id="modelStats"></div>
+      <div class="subtle" id="modelLine"></div>
+    </div>
+  </section>
+
+  <section class="grid split">
+    <div class="panel">
+      <div class="panelHead"><div><h2>Why bets are rejected</h2><p>Latest scan only. No threshold guessing.</p></div></div>
       <div id="rejects" class="rejectList"></div>
     </div>
+
+    <div class="panel">
+      <div class="panelHead"><div><h2>Shadow research</h2><p>Near-miss picks are tracked with zero bankroll risk.</p></div></div>
+      <div class="engineGrid" id="shadowStats"></div>
+      <div class="subtle">Shadow results are research only — they never place a paper or live stake.</div>
+    </div>
   </section>
 
   <section class="panel">
     <div class="panelHead">
-      <div>
-        <h2>Near-miss watchlist</h2>
-        <p>The closest candidates to clearing every risk gate — useful for tuning without forcing bets.</p>
-      </div>
+      <div><h2>Near-miss watchlist</h2><p>Closest candidates to every hard gate, now fully readable on mobile.</p></div>
       <span class="miniBadge" id="marketHealth">MARKET HEALTH …</span>
     </div>
-    <div class="tableWrap">
-      <table>
-        <thead><tr><th>Match</th><th>Pick</th><th>Odds</th><th>Edge</th><th>EV</th><th>Books</th><th>Why rejected</th></tr></thead>
-        <tbody id="nearMisses"></tbody>
-      </table>
-    </div>
+    <div class="pickCards" id="nearMisses"></div>
   </section>
 
   <section class="panel">
     <div class="panelHead">
-      <div>
-        <h2>Accepted signals</h2>
-        <p>Only candidates that clear the current strategy and risk gates.</p>
-      </div>
+      <div><h2>Accepted signals</h2><p>Only candidates that clear the current strategy and risk gates.</p></div>
       <span class="miniBadge" id="acceptedCount">0 ACCEPTED</span>
     </div>
-    <div class="tableWrap">
-      <table>
-        <thead><tr><th>Match</th><th>Pick</th><th>Odds</th><th>Edge</th><th>EV</th><th>Confidence</th><th>Book</th></tr></thead>
-        <tbody id="signals"></tbody>
-      </table>
-    </div>
+    <div class="tableWrap"><table><thead><tr><th>Match</th><th>Pick</th><th>Odds</th><th>Edge</th><th>EV</th><th>Model</th><th>Confidence</th><th>Book</th></tr></thead><tbody id="signals"></tbody></table></div>
   </section>
 
   <section class="panel">
     <div class="panelHead">
-      <div>
-        <h2>Paper ledger</h2>
-        <p>Realistic stake sizing before any live consideration.</p>
-      </div>
+      <div><h2>Paper ledger</h2><p>Stake sizing, result and closing-line value.</p></div>
       <button class="ghost" id="settleBtn" onclick="settle()">Settle results</button>
     </div>
-    <div class="tableWrap">
-      <table>
-        <thead><tr><th>Sport</th><th>Pick</th><th>Book</th><th>Odds</th><th>Stake</th><th>Status</th><th>P/L</th></tr></thead>
-        <tbody id="bets"></tbody>
-      </table>
-    </div>
+    <div class="tableWrap"><table><thead><tr><th>Sport</th><th>Pick</th><th>Book</th><th>Odds</th><th>Stake</th><th>Status</th><th>CLV</th><th>P/L</th></tr></thead><tbody id="bets"></tbody></table></div>
   </section>
 
   <section class="panel">
-    <div class="panelHead">
-      <div>
-        <h2>Scan history</h2>
-        <p>Every real API scan is audited with quota, duration and signal counts.</p>
-      </div>
-    </div>
-    <div class="tableWrap">
-      <table>
-        <thead><tr><th>Time</th><th>Trigger</th><th>Status</th><th>Prices</th><th>Signals</th><th>Accepted</th><th>Bets</th><th>Top EV</th><th>Quota</th></tr></thead>
-        <tbody id="scanHistory"></tbody>
-      </table>
-    </div>
+    <div class="panelHead"><div><h2>Scan history</h2><p>Every real API scan is audited with quota, duration and signal counts.</p></div></div>
+    <div class="tableWrap"><table><thead><tr><th>Time</th><th>Trigger</th><th>Status</th><th>Prices</th><th>Signals</th><th>Accepted</th><th>Bets</th><th>Top EV</th><th>Quota</th></tr></thead><tbody id="scanHistory"></tbody></table></div>
   </section>
 
   <div id="toast"></div>
