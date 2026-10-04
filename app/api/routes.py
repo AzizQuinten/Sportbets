@@ -7,13 +7,13 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.config import get_settings
-from app.models.db_models import PaperBet, ScanRun, ShadowPick, Signal, TeamRating
+from app.models.db_models import PaperBet, ScanRun, ShadowPick, Signal
 from app.providers.odds_api import OddsAPIProvider
 from app.services.cycle import bootstrap_model_tick, execute_cycle, latest_scan, latest_successful_scan, next_scan_due_at, recommended_scan_interval_minutes
 from app.services.engine import settle_h2h_from_scores
 from app.services.model import ingest_completed_scores, model_summary
 
-router = APIRouter(); settings = get_settings(); APP_VERSION = '1.6.3'
+router = APIRouter(); settings = get_settings(); APP_VERSION = '1.8.5'
 
 def _scan_dict(x):
     if not x: return None
@@ -25,10 +25,18 @@ def health(db: Session=Depends(get_db)):
 
 @router.post('/api/run-cycle')
 def run_cycle(db: Session=Depends(get_db)):
-    if not settings.odds_api_key: raise HTTPException(400,'ODDS_API_KEY missing')
-    r=execute_cycle(db,trigger='manual')
-    if r.get('status')=='FAILED': raise HTTPException(500,r.get('detail','Scan failed'))
-    if r.get('status')=='BUSY': raise HTTPException(409,r.get('detail','Scan already running'))
+    if not settings.odds_api_key: raise HTTPException(400,detail={'message':'ODDS_API_KEY missing','stage':'configuration'})
+    try:
+        r=execute_cycle(db,trigger='manual')
+    except Exception as exc:
+        r={'status':'FAILED','detail':f'{type(exc).__name__}: {exc}','stage':'run_cycle_unhandled'}
+    if r.get('status')=='BUSY': raise HTTPException(409,detail={'message':r.get('detail','Scan already running'),'stage':'cycle_lock'})
+    # A failed scan is returned as structured JSON instead of being hidden behind
+    # a generic HTTP 500. The scanner is a research job: diagnostics are part of
+    # the product and must remain visible on mobile/Railway.
+    if r.get('status')=='FAILED':
+        r.setdefault('message',r.get('detail','Scan failed'))
+        r.setdefault('stage','execute_cycle')
     return r
 
 @router.post('/api/bootstrap-model')
@@ -62,6 +70,11 @@ def kpis(db:Session=Depends(get_db)):
 def engine_status(db:Session=Depends(get_db)):
     latest=latest_scan(db); successful=latest_successful_scan(db)
     return {'version':APP_VERSION,'configured_sports':settings.sports,'scan_window':'now through tomorrow 23:59 Europe/Amsterdam','auto_scan_enabled':settings.auto_scan_enabled,'auto_settle_enabled':settings.auto_settle_enabled,'historical_bootstrap_enabled':settings.historical_bootstrap_enabled,'historical_bootstrap_seasons':settings.historical_bootstrap_seasons,'scheduler_tick_minutes':settings.poll_minutes,'recommended_scan_interval_minutes':recommended_scan_interval_minutes(db),'next_scan_due_at':next_scan_due_at(db),'quota_floor':settings.api_quota_floor,'latest_scan':_scan_dict(latest),'latest_successful_scan':_scan_dict(successful),'model':model_summary(db),'strategy':{'min_bookmakers':settings.min_bookmakers,'min_edge':settings.min_edge,'min_ev':settings.min_ev,'max_vig':settings.max_vig,'kelly_fraction':settings.kelly_fraction,'max_stake_pct':settings.max_stake_pct,'max_event_exposure_pct':settings.max_event_exposure_pct,'max_daily_exposure_pct':settings.max_daily_exposure_pct,'paper_only':settings.paper_only,'max_model_weight':settings.max_model_weight,'min_model_reliability_for_paper':settings.min_model_reliability_for_paper,'max_model_market_gap':settings.max_model_market_gap,'max_blended_model_shift':settings.max_blended_model_shift,'max_paper_ev':settings.max_paper_ev,'one_pick_per_event_market':settings.one_pick_per_event_market,'shadow_min_edge':settings.shadow_min_edge,'shadow_min_ev':settings.shadow_min_ev}}
+
+@router.get('/api/scan-diagnostics')
+def scan_diagnostics(db:Session=Depends(get_db)):
+    latest=latest_scan(db); successful=latest_successful_scan(db)
+    return {'version':APP_VERSION,'latest':_scan_dict(latest),'last_successful':_scan_dict(successful),'configured_sports':settings.sports,'markets':settings.market_list,'region':settings.odds_region,'api_key_present':bool(settings.odds_api_key),'scan_window':'now through tomorrow 23:59 Europe/Amsterdam'}
 
 def _latest_scan_signals(db):
     run=latest_successful_scan(db)
