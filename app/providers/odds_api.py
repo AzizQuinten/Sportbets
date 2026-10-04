@@ -14,34 +14,47 @@ class OddsAPIProvider:
 
     @classmethod
     def _scan_window_utc(cls):
-        """Return the UTC window covering today + tomorrow in Dutch local time.
-
-        This keeps the betting engine focused on actionable fixtures and prevents
-        next-week matches from entering signal generation, shadow research or the
-        paper ledger. DST is handled by Europe/Amsterdam automatically.
-        """
+        """UTC boundaries covering today and tomorrow in Dutch local time."""
         now_local = datetime.now(cls.SCAN_TZ)
         start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         end_local = start_local + timedelta(days=2)
         return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
     def fetch_odds(self, sport_key: str, markets: list[str]):
+        """Fetch normal odds payload, then strictly keep fixtures from today/tomorrow.
+
+        Filtering locally avoids relying on optional API query parameters while still
+        guaranteeing that later fixtures never reach signal generation.
+        """
         url = f'{self.BASE}/sports/{sport_key}/odds'
-        start_utc, end_utc = self._scan_window_utc()
         params = {
             'apiKey': self.api_key,
             'regions': self.region,
             'markets': ','.join(markets),
             'oddsFormat': 'decimal',
             'dateFormat': 'iso',
-            'commenceTimeFrom': start_utc.isoformat().replace('+00:00', 'Z'),
-            # The API upper bound is inclusive, so subtract a microsecond to keep
-            # fixtures at 00:00 the day after tomorrow out of the scan.
-            'commenceTimeTo': (end_utc - timedelta(microseconds=1)).isoformat().replace('+00:00', 'Z'),
         }
         r = requests.get(url, params=params, timeout=self.timeout)
         r.raise_for_status()
-        return r.json(), {
+        events = r.json()
+
+        start_utc, end_utc = self._scan_window_utc()
+        filtered = []
+        for event in events:
+            raw_time = event.get('commence_time')
+            if not raw_time:
+                continue
+            try:
+                commence = datetime.fromisoformat(raw_time.replace('Z', '+00:00'))
+                if commence.tzinfo is None:
+                    commence = commence.replace(tzinfo=timezone.utc)
+                commence = commence.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if start_utc <= commence < end_utc:
+                filtered.append(event)
+
+        return filtered, {
             'remaining': r.headers.get('x-requests-remaining'),
             'used': r.headers.get('x-requests-used'),
             'last': r.headers.get('x-requests-last'),
