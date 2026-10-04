@@ -1,42 +1,63 @@
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.db import get_db
+from app.core.db import get_db, SessionLocal
 from app.core.config import get_settings
 from app.models.db_models import PaperBet, ScanRun, ShadowPick, Signal
 from app.providers.odds_api import OddsAPIProvider
+from app.services import cycle as cycle_service
 from app.services.cycle import bootstrap_model_tick, execute_cycle, latest_scan, latest_successful_scan, next_scan_due_at, recommended_scan_interval_minutes
 from app.services.engine import settle_h2h_from_scores
 from app.services.model import ingest_completed_scores, model_summary
 
-router = APIRouter(); settings = get_settings(); APP_VERSION = '1.8.5'
+router = APIRouter(); settings = get_settings(); APP_VERSION = '1.9.0'
+_manual_launch_lock = threading.Lock()
 
 def _scan_dict(x):
     if not x: return None
     return {'id':x.id,'trigger':x.trigger,'status':x.status,'started_at':x.started_at,'finished_at':x.finished_at,'duration_ms':x.duration_ms,'sports':x.sports,'snapshots':x.snapshots,'signals':x.signals,'accepted':x.accepted,'paper_bets':x.paper_bets,'reject_counts':x.reject_counts or {},'top_edge':x.top_edge,'top_ev':x.top_ev,'quota_remaining':x.quota_remaining,'quota_used':x.quota_used,'error':x.error}
 
+def _repair_stale_scans(db: Session):
+    cutoff=datetime.now(timezone.utc)-timedelta(minutes=8)
+    stale=db.scalars(select(ScanRun).where(ScanRun.status=='RUNNING',ScanRun.started_at<cutoff)).all()
+    if not stale:return 0
+    now=datetime.now(timezone.utc)
+    for x in stale:
+        x.status='FAILED'; x.finished_at=now; x.duration_ms=int((now-x.started_at).total_seconds()*1000); x.error='Watchdog: scan exceeded 8 minute runtime and was marked stale.'
+    db.commit(); return len(stale)
+
+def _manual_scan_worker():
+    try:
+        with SessionLocal() as worker_db:
+            execute_cycle(worker_db,trigger='manual')
+    except Exception:
+        # execute_cycle persists normal scanner diagnostics. This guard prevents
+        # an uncaught worker exception from taking down the web process.
+        pass
+
+def _launch_manual_scan(db: Session):
+    with _manual_launch_lock:
+        _repair_stale_scans(db)
+        if cycle_service._cycle_lock.locked():
+            return {'status':'BUSY','detail':'A scan is already running.'}
+        t=threading.Thread(target=_manual_scan_worker,name='manual-scan',daemon=True)
+        t.start()
+        return {'status':'STARTED','message':'Scan started in background. Dashboard will update automatically.'}
+
 @router.get('/health')
 def health(db: Session=Depends(get_db)):
-    x=latest_scan(db); return {'ok':True,'version':APP_VERSION,'paper_only':settings.paper_only,'auto_scan_enabled':settings.auto_scan_enabled,'latest_scan_status':x.status if x else None,'configured_sports':settings.sports,'model':model_summary(db)}
+    _repair_stale_scans(db); x=latest_scan(db); return {'ok':True,'version':APP_VERSION,'paper_only':settings.paper_only,'auto_scan_enabled':settings.auto_scan_enabled,'latest_scan_status':x.status if x else None,'configured_sports':settings.sports,'model':model_summary(db)}
 
 @router.post('/api/run-cycle')
 def run_cycle(db: Session=Depends(get_db)):
     if not settings.odds_api_key: raise HTTPException(400,detail={'message':'ODDS_API_KEY missing','stage':'configuration'})
-    try:
-        r=execute_cycle(db,trigger='manual')
-    except Exception as exc:
-        r={'status':'FAILED','detail':f'{type(exc).__name__}: {exc}','stage':'run_cycle_unhandled'}
-    if r.get('status')=='BUSY': raise HTTPException(409,detail={'message':r.get('detail','Scan already running'),'stage':'cycle_lock'})
-    # A failed scan is returned as structured JSON instead of being hidden behind
-    # a generic HTTP 500. The scanner is a research job: diagnostics are part of
-    # the product and must remain visible on mobile/Railway.
-    if r.get('status')=='FAILED':
-        r.setdefault('message',r.get('detail','Scan failed'))
-        r.setdefault('stage','execute_cycle')
+    r=_launch_manual_scan(db)
+    if r.get('status')=='BUSY': raise HTTPException(409,detail={'message':r.get('detail'),'stage':'cycle_lock'})
     return r
 
 @router.post('/api/bootstrap-model')
@@ -68,13 +89,13 @@ def kpis(db:Session=Depends(get_db)):
 
 @router.get('/api/engine-status')
 def engine_status(db:Session=Depends(get_db)):
-    latest=latest_scan(db); successful=latest_successful_scan(db)
-    return {'version':APP_VERSION,'configured_sports':settings.sports,'scan_window':'now through tomorrow 23:59 Europe/Amsterdam','auto_scan_enabled':settings.auto_scan_enabled,'auto_settle_enabled':settings.auto_settle_enabled,'historical_bootstrap_enabled':settings.historical_bootstrap_enabled,'historical_bootstrap_seasons':settings.historical_bootstrap_seasons,'scheduler_tick_minutes':settings.poll_minutes,'recommended_scan_interval_minutes':recommended_scan_interval_minutes(db),'next_scan_due_at':next_scan_due_at(db),'quota_floor':settings.api_quota_floor,'latest_scan':_scan_dict(latest),'latest_successful_scan':_scan_dict(successful),'model':model_summary(db),'strategy':{'min_bookmakers':settings.min_bookmakers,'min_edge':settings.min_edge,'min_ev':settings.min_ev,'max_vig':settings.max_vig,'kelly_fraction':settings.kelly_fraction,'max_stake_pct':settings.max_stake_pct,'max_event_exposure_pct':settings.max_event_exposure_pct,'max_daily_exposure_pct':settings.max_daily_exposure_pct,'paper_only':settings.paper_only,'max_model_weight':settings.max_model_weight,'min_model_reliability_for_paper':settings.min_model_reliability_for_paper,'max_model_market_gap':settings.max_model_market_gap,'max_blended_model_shift':settings.max_blended_model_shift,'max_paper_ev':settings.max_paper_ev,'one_pick_per_event_market':settings.one_pick_per_event_market,'shadow_min_edge':settings.shadow_min_edge,'shadow_min_ev':settings.shadow_min_ev}}
+    _repair_stale_scans(db); latest=latest_scan(db); successful=latest_successful_scan(db)
+    return {'version':APP_VERSION,'configured_sports':settings.sports,'scan_window':'now through tomorrow 23:59 Europe/Amsterdam','auto_scan_enabled':settings.auto_scan_enabled,'auto_settle_enabled':settings.auto_settle_enabled,'historical_bootstrap_enabled':settings.historical_bootstrap_enabled,'historical_bootstrap_seasons':settings.historical_bootstrap_seasons,'scheduler_tick_minutes':settings.poll_minutes,'recommended_scan_interval_minutes':recommended_scan_interval_minutes(db),'next_scan_due_at':next_scan_due_at(db),'quota_floor':settings.api_quota_floor,'latest_scan':_scan_dict(latest),'latest_successful_scan':_scan_dict(successful),'scanner_running':cycle_service._cycle_lock.locked(),'model':model_summary(db),'strategy':{'min_bookmakers':settings.min_bookmakers,'min_edge':settings.min_edge,'min_ev':settings.min_ev,'max_vig':settings.max_vig,'kelly_fraction':settings.kelly_fraction,'max_stake_pct':settings.max_stake_pct,'max_event_exposure_pct':settings.max_event_exposure_pct,'max_daily_exposure_pct':settings.max_daily_exposure_pct,'paper_only':settings.paper_only,'max_model_weight':settings.max_model_weight,'min_model_reliability_for_paper':settings.min_model_reliability_for_paper,'max_model_market_gap':settings.max_model_market_gap,'max_blended_model_shift':settings.max_blended_model_shift,'max_paper_ev':settings.max_paper_ev,'one_pick_per_event_market':settings.one_pick_per_event_market,'shadow_min_edge':settings.shadow_min_edge,'shadow_min_ev':settings.shadow_min_ev}}
 
 @router.get('/api/scan-diagnostics')
 def scan_diagnostics(db:Session=Depends(get_db)):
-    latest=latest_scan(db); successful=latest_successful_scan(db)
-    return {'version':APP_VERSION,'latest':_scan_dict(latest),'last_successful':_scan_dict(successful),'configured_sports':settings.sports,'markets':settings.market_list,'region':settings.odds_region,'api_key_present':bool(settings.odds_api_key),'scan_window':'now through tomorrow 23:59 Europe/Amsterdam'}
+    _repair_stale_scans(db); latest=latest_scan(db); successful=latest_successful_scan(db)
+    return {'version':APP_VERSION,'latest':_scan_dict(latest),'last_successful':_scan_dict(successful),'scanner_running':cycle_service._cycle_lock.locked(),'configured_sports':settings.sports,'markets':settings.market_list,'region':settings.odds_region,'api_key_present':bool(settings.odds_api_key),'scan_window':'now through tomorrow 23:59 Europe/Amsterdam'}
 
 def _latest_scan_signals(db):
     run=latest_successful_scan(db)
