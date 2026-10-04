@@ -6,6 +6,7 @@ from app.core.config import get_settings
 from app.models.db_models import OddsSnapshot, PaperBet, ShadowPick, Signal
 from app.services.model import external_probability
 from app.services.quant import consensus_market, expected_value, confidence_score, market_quality, uncertainty_adjusted_ev, fractional_kelly_stake
+from app.services.validation import risk_multiplier
 settings=get_settings()
 
 def ingest_rows(db:Session,rows:list[dict])->int:
@@ -17,11 +18,9 @@ def _today_exposure(db):
 def _event_exposure(db,event_id):return float(db.scalar(select(func.coalesce(func.sum(PaperBet.stake),0.0)).where(PaperBet.event_id==event_id)) or 0.0)
 
 def _dynamic_gates(con,model_meta):
-    """Quality-aware gates. Never loosen merely to manufacture bets."""
     reliability=float(model_meta.get('reliability') or 0.0)
     q=market_quality(con['books'],con['vig'],0.0,con.get('outlier_books',0),con.get('raw_books',con['books']))
     min_books=max(3,settings.min_bookmakers-1) if q>=0.78 else settings.min_bookmakers
-    # Mature independent model + deep clean market earns a small evidence-based relaxation.
     mature=reliability>=0.90 and q>=0.75
     min_edge=settings.min_edge*(0.80 if mature else 1.0)
     min_ev=settings.min_ev*(0.80 if mature else 1.0)
@@ -61,6 +60,7 @@ def build_signals(db:Session,rows:list[dict])->list[Signal]:
 
 def place_paper_bets(db:Session,signals:list[Signal])->int:
     count=0;daily_cap=settings.bankroll*settings.max_daily_exposure_pct;event_cap=settings.bankroll*settings.max_event_exposure_pct
+    health_mult=risk_multiplier(db)
     def rank(x):return ((x.meta or {}).get('adjusted_ev',x.ev),x.confidence,x.edge)
     accepted=sorted((x for x in signals if x.accepted),key=rank,reverse=True)
     if settings.one_pick_per_event_market:
@@ -75,7 +75,8 @@ def place_paper_bets(db:Session,signals:list[Signal])->int:
         day=_today_exposure(db)
         if day>=daily_cap:break
         remaining_event=max(0.0,event_cap-_event_exposure(db,s.event_id));remaining_day=max(0.0,daily_cap-day)
-        stake=min(fractional_kelly_stake(settings.bankroll,s.model_prob,s.best_odds,s.confidence,settings.kelly_fraction,settings.max_stake_pct),remaining_event,remaining_day)
+        base_stake=fractional_kelly_stake(settings.bankroll,s.model_prob,s.best_odds,s.confidence,settings.kelly_fraction,settings.max_stake_pct)
+        stake=min(base_stake*health_mult,remaining_event,remaining_day)
         if stake<1.0:continue
         bet=PaperBet(event_id=s.event_id,sport_key=s.sport_key,market=s.market,outcome=s.outcome,bookmaker=s.best_bookmaker,odds=s.best_odds,stake=round(stake,2),model_prob=s.model_prob,fair_prob=s.fair_prob,edge=s.edge,ev=s.ev,commence_time=datetime.fromisoformat(s.meta['commence_time']))
         db.add(bet)
