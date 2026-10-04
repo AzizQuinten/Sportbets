@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#070b12">
   <title>{{ app_name }}</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v={{ app_version }}">
 </head>
 <body>
 <div class="wrap">
   <header>
     <div>
-      <span class="eyebrow">PAPER EDGE ENGINE · V1.2</span>
+      <span class="eyebrow">PAPER EDGE ENGINE · V{{ app_version }}</span>
       <h1>SportBet Edge Lab</h1>
       <p>Robust market consensus · Elo/Poisson learning · adaptive scans · shadow research · CLV tracking</p>
     </div>
@@ -85,6 +85,6 @@
 
   <div id="toast"></div>
 </div>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v={{ app_version }}"></script>
 </body>
 </html>
