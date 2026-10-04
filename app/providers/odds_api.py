@@ -12,30 +12,28 @@ class OddsAPIProvider:
 
     def fetch_odds(self, sport_key: str, markets: list[str]):
         url = f'{self.BASE}/sports/{sport_key}/odds'
-        params = {
-            'apiKey': self.api_key,
-            'regions': self.region,
-            'markets': ','.join(markets),
-            'oddsFormat': 'decimal',
-            'dateFormat': 'iso',
-        }
+        params = {'apiKey': self.api_key, 'regions': self.region, 'markets': ','.join(markets), 'oddsFormat': 'decimal', 'dateFormat': 'iso'}
         r = requests.get(url, params=params, timeout=self.timeout)
         r.raise_for_status()
-        return r.json(), {
-            'remaining': r.headers.get('x-requests-remaining'),
-            'used': r.headers.get('x-requests-used'),
-            'last': r.headers.get('x-requests-last'),
-        }
+        return r.json(), {'remaining': r.headers.get('x-requests-remaining'), 'used': r.headers.get('x-requests-used'), 'last': r.headers.get('x-requests-last')}
 
     def fetch_scores(self, sport_key: str, days_from: int = 3):
         url = f'{self.BASE}/sports/{sport_key}/scores'
-        r = requests.get(url, params={
-            'apiKey': self.api_key,
-            'daysFrom': days_from,
-            'dateFormat': 'iso',
-        }, timeout=self.timeout)
+        r = requests.get(url, params={'apiKey': self.api_key, 'daysFrom': max(1, min(3, int(days_from))), 'dateFormat': 'iso'}, timeout=self.timeout)
         r.raise_for_status()
         return r.json()
+
+    def fetch_score_history(self, sport_key: str, windows: int = 1):
+        """Fetch the deepest score window supported by the live API without pretending it is historical data."""
+        merged = {}
+        # Scores endpoint currently exposes only a short recent window. Keep this helper explicit
+        # so a future historical provider can be plugged in without contaminating model code.
+        for _ in range(max(1, windows)):
+            for event in self.fetch_scores(sport_key, days_from=3):
+                if event.get('id'):
+                    merged[event['id']] = event
+            break
+        return list(merged.values())
 
     @staticmethod
     def flatten(events: list[dict]):
@@ -46,17 +44,5 @@ class OddsAPIProvider:
             for book in event.get('bookmakers', []):
                 for market in book.get('markets', []):
                     for out in market.get('outcomes', []):
-                        rows.append({
-                            'event_id': event['id'],
-                            'sport_key': event['sport_key'],
-                            'commence_time': commence,
-                            'home_team': event['home_team'],
-                            'away_team': event['away_team'],
-                            'market': market['key'],
-                            'bookmaker': book['key'],
-                            'outcome': out['name'],
-                            'price': float(out['price']),
-                            'point': out.get('point'),
-                            'observed_at': now,
-                        })
+                        rows.append({'event_id': event['id'], 'sport_key': event['sport_key'], 'commence_time': commence, 'home_team': event['home_team'], 'away_team': event['away_team'], 'market': market['key'], 'bookmaker': book['key'], 'outcome': out['name'], 'price': float(out['price']), 'point': out.get('point'), 'observed_at': now})
         return rows
