@@ -10,10 +10,10 @@ from app.core.db import Base, engine
 from app.api.routes import router
 from app.services.cycle import auto_scan_tick, settle_if_needed, refresh_model_tick, bootstrap_model_tick
 
-APP_VERSION = '1.5'
+APP_VERSION = '1.6.1'
 settings = get_settings()
 BASE = Path(__file__).resolve().parent
-app = FastAPI(title=settings.app_name, version=f'{APP_VERSION}.0')
+app = FastAPI(title=settings.app_name, version=APP_VERSION)
 app.include_router(router)
 app.mount('/static', StaticFiles(directory=BASE / 'static'), name='static')
 templates = Jinja2Templates(directory=BASE / 'templates')
