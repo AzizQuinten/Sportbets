@@ -23,6 +23,18 @@ class OddsAPIProvider:
     def _iso_utc(dt: datetime) -> str:
         return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
+    @staticmethod
+    def _parse_time(raw_time):
+        if not raw_time:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(raw_time).replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
     def _get(self, url: str, params: dict):
         r = requests.get(url, params=params, timeout=self.timeout)
         quota = {
@@ -39,13 +51,52 @@ class OddsAPIProvider:
         except ValueError as exc:
             raise RuntimeError(f'Odds API returned non-JSON HTTP {r.status_code}') from exc
 
-    def fetch_odds(self, sport_key: str, markets: list[str]):
-        """Fetch the provider's upcoming board and enforce our horizon locally.
+    def fetch_active_sports(self):
+        """Quota-free provider catalogue. Only active soccer competitions are returned."""
+        _, payload, _ = self._get(f'{self.BASE}/sports/', {'apiKey': self.api_key})
+        if not isinstance(payload, list):
+            raise RuntimeError(f'Unexpected sports payload: {type(payload).__name__}')
+        return [
+            x for x in payload
+            if x.get('active') is not False
+            and (str(x.get('key', '')).startswith('soccer_') or str(x.get('group', '')).lower().startswith('soccer'))
+            and not x.get('has_outrights', False)
+        ]
 
-        Provider-side commence filters are intentionally not used here. The local
-        Amsterdam horizon is the single source of truth, which also gives us raw
-        event diagnostics when a league has no fixtures today/tomorrow.
-        """
+    def fetch_events(self, sport_key: str):
+        """Quota-free fixture preflight for one competition, filtered to today + tomorrow."""
+        window_start, window_end = self._scan_window()
+        r, payload, _ = self._get(
+            f'{self.BASE}/sports/{sport_key}/events',
+            {'apiKey': self.api_key, 'dateFormat': 'iso'},
+        )
+        if not isinstance(payload, list):
+            raise RuntimeError(f'Unexpected events payload for {sport_key}: {type(payload).__name__}')
+        eligible = []
+        past = future = invalid = 0
+        for event in payload:
+            commence = self._parse_time(event.get('commence_time'))
+            if commence is None:
+                invalid += 1
+            elif commence < window_start:
+                past += 1
+            elif commence > window_end:
+                future += 1
+            else:
+                eligible.append(event)
+        return eligible, {
+            'http_status': r.status_code,
+            'raw_events': len(payload),
+            'eligible_events': len(eligible),
+            'past_events': past,
+            'beyond_window': future,
+            'invalid_times': invalid,
+            'window_from': self._iso_utc(window_start),
+            'window_to': self._iso_utc(window_end),
+        }
+
+    def fetch_odds(self, sport_key: str, markets: list[str]):
+        """Fetch paid odds only after quota-free fixture preflight found a relevant game."""
         window_start, window_end = self._scan_window()
         url = f'{self.BASE}/sports/{sport_key}/odds/'
         params = {
@@ -54,6 +105,8 @@ class OddsAPIProvider:
             'markets': ','.join(markets),
             'oddsFormat': 'decimal',
             'dateFormat': 'iso',
+            'commenceTimeFrom': self._iso_utc(window_start),
+            'commenceTimeTo': self._iso_utc(window_end),
         }
         r, payload, quota = self._get(url, params)
         if not isinstance(payload, list):
@@ -70,19 +123,10 @@ class OddsAPIProvider:
                 raw_markets += len(mkts)
                 for market in mkts:
                     raw_outcomes += len(market.get('outcomes') or [])
-            raw_time = event.get('commence_time')
-            if not raw_time:
+            commence = self._parse_time(event.get('commence_time'))
+            if commence is None:
                 invalid_times += 1
-                continue
-            try:
-                commence = datetime.fromisoformat(str(raw_time).replace('Z', '+00:00'))
-                if commence.tzinfo is None:
-                    commence = commence.replace(tzinfo=timezone.utc)
-                commence = commence.astimezone(timezone.utc)
-            except (TypeError, ValueError, OverflowError):
-                invalid_times += 1
-                continue
-            if commence < window_start:
+            elif commence < window_start:
                 past_events += 1
             elif commence > window_end:
                 beyond_window += 1
@@ -133,12 +177,8 @@ class OddsAPIProvider:
         now = datetime.now(timezone.utc)
         rows = []
         for event in events:
-            try:
-                commence = datetime.fromisoformat(str(event['commence_time']).replace('Z', '+00:00'))
-                if commence.tzinfo is None:
-                    commence = commence.replace(tzinfo=timezone.utc)
-                commence = commence.astimezone(timezone.utc)
-            except (KeyError, TypeError, ValueError, OverflowError):
+            commence = OddsAPIProvider._parse_time(event.get('commence_time'))
+            if commence is None:
                 continue
             event_id, sport_key = event.get('id'), event.get('sport_key')
             home, away = event.get('home_team'), event.get('away_team')
