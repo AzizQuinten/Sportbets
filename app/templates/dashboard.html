@@ -1,0 +1,7 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ app_name }}</title><link rel="stylesheet" href="/static/app.css"></head><body>
+<div class="wrap"><header><div><span class="eyebrow">PAPER EDGE ENGINE</span><h1>SportBet Edge Lab</h1><p>Price-first betting research · no-vig consensus · controlled Kelly · audit trail</p></div><div class="status">PAPER ONLY</div></header>
+<section class="grid kpis" id="kpis"></section>
+<section class="panel"><div class="panelHead"><div><h2>Accepted signals</h2><p>Only candidates that clear the current risk gates.</p></div><button onclick="runCycle()">Run scan</button></div><div class="tableWrap"><table><thead><tr><th>Match</th><th>Pick</th><th>Odds</th><th>Edge</th><th>EV</th><th>Confidence</th><th>Book</th></tr></thead><tbody id="signals"></tbody></table></div></section>
+<section class="panel"><div class="panelHead"><div><h2>Paper ledger</h2><p>Realistic stake sizing before any live consideration.</p></div><button class="ghost" onclick="settle()">Settle results</button></div><div class="tableWrap"><table><thead><tr><th>Sport</th><th>Pick</th><th>Odds</th><th>Stake</th><th>Status</th><th>P/L</th></tr></thead><tbody id="bets"></tbody></table></div></section>
+<div id="toast"></div></div><script src="/static/app.js"></script></body></html>
