@@ -1,4 +1,6 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -8,14 +10,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from app.core.config import get_settings
 from app.core.db import Base, engine
 from app.api.routes import router
-from app.services.cycle import auto_scan_tick, settle_if_needed
+from app.services.cycle import auto_scan_tick, settle_if_needed, refresh_model_tick
 
 settings = get_settings()
 BASE = Path(__file__).resolve().parent
-app = FastAPI(title=settings.app_name, version='1.1.0')
+app = FastAPI(title=settings.app_name, version='1.2.0')
 app.include_router(router)
-app.mount('/static', StaticFiles(directory=BASE/'static'), name='static')
-templates = Jinja2Templates(directory=BASE/'templates')
+app.mount('/static', StaticFiles(directory=BASE / 'static'), name='static')
+templates = Jinja2Templates(directory=BASE / 'templates')
 scheduler = BackgroundScheduler(timezone='UTC')
 
 
@@ -23,14 +25,31 @@ scheduler = BackgroundScheduler(timezone='UTC')
 def startup():
     Base.metadata.create_all(bind=engine)
 
-    # Wake frequently but let cycle.py decide whether a real API scan is due.
-    # This gives us near-kickoff responsiveness without burning a small quota.
     if settings.auto_scan_enabled and settings.odds_api_key:
         scheduler.add_job(
             auto_scan_tick,
             'interval',
             minutes=max(1, settings.poll_minutes),
             id='adaptive-auto-scan',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    if settings.odds_api_key:
+        # Bootstrap the learning tables shortly after deploy, then refresh twice daily.
+        scheduler.add_job(
+            refresh_model_tick,
+            'date',
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=45),
+            id='initial-model-refresh',
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            refresh_model_tick,
+            'interval',
+            hours=max(1, settings.model_refresh_hours),
+            id='model-learning-refresh',
             replace_existing=True,
             max_instances=1,
             coalesce=True,
