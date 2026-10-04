@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 import threading
 
@@ -51,24 +52,69 @@ def should_auto_scan(db):
 def _cleanup_history(db):
     now=_utcnow(); db.execute(delete(OddsSnapshot).where(OddsSnapshot.observed_at<now-timedelta(days=settings.snapshot_retention_days))); db.execute(delete(Signal).where(Signal.created_at<now-timedelta(days=settings.signal_retention_days))); db.commit()
 
+def _discover_today_tomorrow(provider: OddsAPIProvider):
+    """Discover active soccer competitions for free, then preflight fixtures concurrently.
+
+    /sports and /events do not consume Odds API usage credits. Paid /odds calls are
+    therefore made only for competitions that actually have a game in our Amsterdam
+    today+tomorrow window.
+    """
+    sports = provider.fetch_active_sports()
+    keys = list(dict.fromkeys(x.get('key') for x in sports if x.get('key')))
+    eligible, preflight, errors = [], {}, []
+
+    def check(key):
+        p = OddsAPIProvider(provider.api_key, provider.region, provider.timeout)
+        events, meta = p.fetch_events(key)
+        return key, events, meta
+
+    with ThreadPoolExecutor(max_workers=min(10, max(1, len(keys)))) as pool:
+        futures = {pool.submit(check, key): key for key in keys}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                _, events, meta = future.result()
+                preflight[key] = meta
+                if events:
+                    eligible.append(key)
+            except Exception as exc:
+                errors.append(f'{key}: preflight {type(exc).__name__}: {exc}')
+                preflight[key] = {'eligible_events': 0, 'status': 'ERROR', 'error': str(exc)[:200]}
+    eligible.sort()
+    return eligible, preflight, errors, len(keys)
+
 def execute_cycle(db: Session, trigger='manual'):
     if not _cycle_lock.acquire(blocking=False):return {'status':'BUSY','detail':'A scan is already running.'}
-    started=_utcnow(); scan=ScanRun(trigger=trigger,status='RUNNING',started_at=started,sports=len(settings.sports)); db.add(scan); db.commit(); db.refresh(scan)
+    started=_utcnow(); scan=ScanRun(trigger=trigger,status='RUNNING',started_at=started,sports=0); db.add(scan); db.commit(); db.refresh(scan)
     total_rows=total_bets=total_shadow=clv_updates=0; all_signals=[]; last_quota={}; errors=[]; league_stats={}
+    discovery={'mode':'dynamic_active_soccer','active_soccer_leagues':0,'eligible_leagues':0,'eligible_keys':[],'preflight_errors':[]}
     try:
         if not settings.odds_api_key:raise RuntimeError('ODDS_API_KEY missing')
         provider=OddsAPIProvider(settings.odds_api_key,settings.odds_region)
-        for sport in settings.sports:
-            stat={'status':'OK','raw_events':0,'events':0,'books':0,'markets':0,'outcomes':0,'prices':0,'signals':0,'accepted':0,'bets':0,'shadow':0,'filtered_future':0,'filtered_past':0}
+        try:
+            sports, preflight, preflight_errors, active_count = _discover_today_tomorrow(provider)
+            discovery.update({'active_soccer_leagues':active_count,'eligible_leagues':len(sports),'eligible_keys':sports,'preflight_errors':preflight_errors})
+            errors.extend(preflight_errors)
+        except Exception as exc:
+            sports=list(settings.sports); preflight={}; discovery.update({'mode':'configured_fallback','eligible_leagues':len(sports),'eligible_keys':sports,'discovery_error':f'{type(exc).__name__}: {exc}'})
+            errors.append(f'discovery: {type(exc).__name__}: {exc}')
+
+        scan.sports=len(sports)
+        if not sports:
+            discovery['diagnosis']='no_supported_soccer_fixtures_today_or_tomorrow'
+
+        for sport in sports:
+            pf=preflight.get(sport,{})
+            stat={'status':'OK','raw_events':_to_int(pf.get('raw_events')) or 0,'events':_to_int(pf.get('eligible_events')) or 0,'books':0,'markets':0,'outcomes':0,'prices':0,'signals':0,'accepted':0,'bets':0,'shadow':0,'filtered_future':_to_int(pf.get('beyond_window')) or 0,'filtered_past':_to_int(pf.get('past_events')) or 0,'preflight':True}
             try:
                 events,quota=provider.fetch_odds(sport,settings.market_list); last_quota=quota or last_quota
-                stat.update({'raw_events':_to_int(quota.get('raw_events')) or 0,'events':len(events),'books':_to_int(quota.get('eligible_bookmakers')) or 0,'markets':_to_int(quota.get('eligible_markets')) or 0,'outcomes':_to_int(quota.get('eligible_outcomes')) or 0,'filtered_future':_to_int(quota.get('beyond_window')) or 0,'filtered_past':_to_int(quota.get('past_events')) or 0,'window_from':quota.get('window_from'),'window_to':quota.get('window_to')})
+                stat.update({'raw_events':_to_int(quota.get('raw_events')) or stat['raw_events'],'events':len(events),'books':_to_int(quota.get('eligible_bookmakers')) or 0,'markets':_to_int(quota.get('eligible_markets')) or 0,'outcomes':_to_int(quota.get('eligible_outcomes')) or 0,'filtered_future':_to_int(quota.get('beyond_window')) or 0,'filtered_past':_to_int(quota.get('past_events')) or 0,'window_from':quota.get('window_from'),'window_to':quota.get('window_to')})
                 rows=provider.flatten(events); stat['prices']=len(rows)
                 total_rows+=ingest_rows(db,rows); clv_updates+=update_closing_lines(db,rows)
                 signals=build_signals(db,rows); stat['signals']=len(signals); stat['accepted']=sum(1 for s in signals if s.accepted); all_signals.extend(signals)
                 stat['shadow']=track_shadow_picks(db,signals); stat['bets']=place_paper_bets(db,signals); total_shadow+=stat['shadow']; total_bets+=stat['bets']
-                if stat['raw_events']==0: stat['diagnosis']='provider_returned_no_upcoming_events'
-                elif stat['events']==0: stat['diagnosis']='fixtures_exist_but_none_today_or_tomorrow'
+                if stat['raw_events']==0: stat['diagnosis']='provider_returned_no_events_after_positive_preflight'
+                elif stat['events']==0: stat['diagnosis']='odds_endpoint_has_no_games_in_window'
                 elif stat['books']==0: stat['diagnosis']='fixtures_have_no_bookmakers_for_region'
                 elif stat['prices']==0: stat['diagnosis']='bookmaker_payload_present_but_no_valid_prices'
                 elif stat['signals']==0: stat['diagnosis']='prices_loaded_but_no_complete_market_consensus'
@@ -77,13 +123,14 @@ def execute_cycle(db: Session, trigger='manual'):
             except Exception as exc:
                 stat['status']='ERROR'; stat['diagnosis']='provider_or_pipeline_error'; stat['error']=f'{type(exc).__name__}: {exc}'[:300]; errors.append(f'{sport}: {type(exc).__name__}: {exc}'); db.rollback()
             league_stats[sport]=stat
+
         reject_counts=Counter()
         for s in all_signals:
             if not s.accepted and s.reject_reason:reject_counts.update(x for x in s.reject_reason.split(',') if x)
         accepted=sum(1 for s in all_signals if s.accepted); finished=_utcnow(); scan.finished_at=finished; scan.duration_ms=int((finished-started).total_seconds()*1000); scan.snapshots=total_rows; scan.signals=len(all_signals); scan.accepted=accepted; scan.paper_bets=total_bets; scan.reject_counts=dict(reject_counts); scan.top_edge=max((s.edge for s in all_signals),default=None); scan.top_ev=max((s.ev for s in all_signals),default=None); scan.quota_remaining=_to_int(last_quota.get('remaining')); scan.quota_used=_to_int(last_quota.get('used'))
         diag='; '.join(f"{k}:{v['raw_events']}raw>{v['events']}ev>{v['prices']}px>{v['signals']}sig:{v.get('diagnosis','?')}" for k,v in league_stats.items()); scan.error=((' | '.join(errors)+' | ') if errors else '')+diag; scan.error=scan.error[:500]
-        good=sum(1 for v in league_stats.values() if v['status']=='OK'); scan.status='SUCCESS' if not errors else ('PARTIAL' if good else 'FAILED'); db.commit(); _cleanup_history(db)
-        return {'status':scan.status,'scan_id':scan.id,'snapshots':total_rows,'signals':len(all_signals),'accepted':accepted,'paper_bets':total_bets,'shadow_picks':total_shadow,'clv_updates':clv_updates,'reject_counts':dict(reject_counts),'top_edge':scan.top_edge,'top_ev':scan.top_ev,'quota':{'remaining':scan.quota_remaining,'used':scan.quota_used,'last':last_quota.get('last')},'league_stats':league_stats,'errors':errors,'duration_ms':scan.duration_ms}
+        good=sum(1 for v in league_stats.values() if v['status']=='OK'); scan.status='SUCCESS' if not errors else ('PARTIAL' if good or not sports else 'FAILED'); db.commit(); _cleanup_history(db)
+        return {'status':scan.status,'scan_id':scan.id,'snapshots':total_rows,'signals':len(all_signals),'accepted':accepted,'paper_bets':total_bets,'shadow_picks':total_shadow,'clv_updates':clv_updates,'reject_counts':dict(reject_counts),'top_edge':scan.top_edge,'top_ev':scan.top_ev,'quota':{'remaining':scan.quota_remaining,'used':scan.quota_used,'last':last_quota.get('last')},'discovery':discovery,'league_stats':league_stats,'errors':errors,'duration_ms':scan.duration_ms}
     except Exception as exc:
         db.rollback(); return {'status':'FAILED','detail':str(exc)}
     finally:_cycle_lock.release()
