@@ -13,7 +13,7 @@ from app.services.cycle import bootstrap_model_tick, execute_cycle, latest_scan,
 from app.services.engine import settle_h2h_from_scores
 from app.services.model import ingest_completed_scores, model_summary
 
-router = APIRouter(); settings = get_settings(); APP_VERSION = '1.6.2'
+router = APIRouter(); settings = get_settings(); APP_VERSION = '1.6.3'
 
 def _scan_dict(x):
     if not x: return None
@@ -61,7 +61,7 @@ def kpis(db:Session=Depends(get_db)):
 @router.get('/api/engine-status')
 def engine_status(db:Session=Depends(get_db)):
     latest=latest_scan(db); successful=latest_successful_scan(db)
-    return {'version':APP_VERSION,'configured_sports':settings.sports,'scan_window':'today+tomorrow Europe/Amsterdam','auto_scan_enabled':settings.auto_scan_enabled,'auto_settle_enabled':settings.auto_settle_enabled,'historical_bootstrap_enabled':settings.historical_bootstrap_enabled,'historical_bootstrap_seasons':settings.historical_bootstrap_seasons,'scheduler_tick_minutes':settings.poll_minutes,'recommended_scan_interval_minutes':recommended_scan_interval_minutes(db),'next_scan_due_at':next_scan_due_at(db),'quota_floor':settings.api_quota_floor,'latest_scan':_scan_dict(latest),'latest_successful_scan':_scan_dict(successful),'model':model_summary(db),'strategy':{'min_bookmakers':settings.min_bookmakers,'min_edge':settings.min_edge,'min_ev':settings.min_ev,'max_vig':settings.max_vig,'kelly_fraction':settings.kelly_fraction,'max_stake_pct':settings.max_stake_pct,'max_event_exposure_pct':settings.max_event_exposure_pct,'max_daily_exposure_pct':settings.max_daily_exposure_pct,'paper_only':settings.paper_only,'max_model_weight':settings.max_model_weight,'min_model_reliability_for_paper':settings.min_model_reliability_for_paper,'max_model_market_gap':settings.max_model_market_gap,'max_blended_model_shift':settings.max_blended_model_shift,'max_paper_ev':settings.max_paper_ev,'one_pick_per_event_market':settings.one_pick_per_event_market,'shadow_min_edge':settings.shadow_min_edge,'shadow_min_ev':settings.shadow_min_ev}}
+    return {'version':APP_VERSION,'configured_sports':settings.sports,'scan_window':'now through tomorrow 23:59 Europe/Amsterdam','auto_scan_enabled':settings.auto_scan_enabled,'auto_settle_enabled':settings.auto_settle_enabled,'historical_bootstrap_enabled':settings.historical_bootstrap_enabled,'historical_bootstrap_seasons':settings.historical_bootstrap_seasons,'scheduler_tick_minutes':settings.poll_minutes,'recommended_scan_interval_minutes':recommended_scan_interval_minutes(db),'next_scan_due_at':next_scan_due_at(db),'quota_floor':settings.api_quota_floor,'latest_scan':_scan_dict(latest),'latest_successful_scan':_scan_dict(successful),'model':model_summary(db),'strategy':{'min_bookmakers':settings.min_bookmakers,'min_edge':settings.min_edge,'min_ev':settings.min_ev,'max_vig':settings.max_vig,'kelly_fraction':settings.kelly_fraction,'max_stake_pct':settings.max_stake_pct,'max_event_exposure_pct':settings.max_event_exposure_pct,'max_daily_exposure_pct':settings.max_daily_exposure_pct,'paper_only':settings.paper_only,'max_model_weight':settings.max_model_weight,'min_model_reliability_for_paper':settings.min_model_reliability_for_paper,'max_model_market_gap':settings.max_model_market_gap,'max_blended_model_shift':settings.max_blended_model_shift,'max_paper_ev':settings.max_paper_ev,'one_pick_per_event_market':settings.one_pick_per_event_market,'shadow_min_edge':settings.shadow_min_edge,'shadow_min_ev':settings.shadow_min_ev}}
 
 def _latest_scan_signals(db):
     run=latest_successful_scan(db)
