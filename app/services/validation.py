@@ -7,7 +7,7 @@ from statistics import mean
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.db_models import PaperBet
+from app.models.db_models import PaperBet, BetAudit
 
 
 def _clip(p: float) -> float:
@@ -46,17 +46,12 @@ def summarize_rows(rows: list[PaperBet]) -> dict:
     model_brier = mean((float(x.model_prob) - y) ** 2 for x, y in zip(settled, ys))
     market_brier = mean((float(x.fair_prob) - y) ** 2 for x, y in zip(settled, ys))
     return {
-        'n': len(settled),
-        'wins': sum(ys),
-        'winrate': sum(ys) / len(settled),
-        'stake': stake,
-        'pnl': pnl,
-        'roi': pnl / stake if stake else 0.0,
+        'n': len(settled), 'wins': sum(ys), 'winrate': sum(ys) / len(settled),
+        'stake': stake, 'pnl': pnl, 'roi': pnl / stake if stake else 0.0,
         'avg_odds': mean(float(x.odds) for x in settled),
         'avg_clv': mean(clvs) if clvs else None,
         'positive_clv_rate': (sum(1 for x in clvs if x > 0) / len(clvs)) if clvs else None,
-        'model_brier': model_brier,
-        'market_brier': market_brier,
+        'model_brier': model_brier, 'market_brier': market_brier,
         'model_logloss': mean(binary_log_loss(float(x.model_prob), y) for x, y in zip(settled, ys)),
         'market_logloss': mean(binary_log_loss(float(x.fair_prob), y) for x, y in zip(settled, ys)),
         'max_drawdown': _max_drawdown([float(x.pnl or 0.0) for x in settled]),
@@ -68,48 +63,44 @@ def calibration(rows: list[PaperBet], bins: int = 5) -> list[dict]:
     buckets = [[] for _ in range(bins)]
     for x in settled:
         p = _clip(float(x.model_prob))
-        i = min(bins - 1, int(p * bins))
-        buckets[i].append(x)
+        buckets[min(bins - 1, int(p * bins))].append(x)
     out = []
     for i, bucket in enumerate(buckets):
-        if not bucket:
-            continue
+        if not bucket: continue
         preds = [float(x.model_prob) for x in bucket]
         ys = [1.0 if x.result == 'WIN' else 0.0 for x in bucket]
-        out.append({
-            'from': i / bins,
-            'to': (i + 1) / bins,
-            'n': len(bucket),
-            'avg_pred': mean(preds),
-            'actual_rate': mean(ys),
-            'gap': mean(ys) - mean(preds),
-        })
+        out.append({'from': i / bins, 'to': (i + 1) / bins, 'n': len(bucket), 'avg_pred': mean(preds), 'actual_rate': mean(ys), 'gap': mean(ys) - mean(preds)})
     return out
 
 
 def strategy_health_from_summary(s: dict) -> dict:
     n = int(s.get('n') or 0)
     if n < 30:
-        return {'status': 'INSUFFICIENT_DATA', 'risk_multiplier': 1.0, 'reasons': [f'{n}/30 settled bets']}
+        return {'status': 'INSUFFICIENT_DATA', 'risk_multiplier': 1.0, 'reasons': [f'{n}/30 settled CORE bets']}
     reasons = []
     avg_clv = s.get('avg_clv')
-    if avg_clv is not None and avg_clv < -0.01:
-        reasons.append('negative_clv')
+    if avg_clv is not None and avg_clv < -0.01: reasons.append('negative_clv')
     mb, kb = s.get('model_brier'), s.get('market_brier')
-    if mb is not None and kb is not None and mb > kb + 0.02:
-        reasons.append('model_brier_worse_than_market')
-    if s.get('roi', 0.0) < -0.08:
-        reasons.append('material_negative_roi')
-    if len(reasons) >= 2:
-        return {'status': 'DEGRADED', 'risk_multiplier': 0.25, 'reasons': reasons}
-    if reasons:
-        return {'status': 'WATCH', 'risk_multiplier': 0.50, 'reasons': reasons}
+    if mb is not None and kb is not None and mb > kb + 0.02: reasons.append('model_brier_worse_than_market')
+    if s.get('roi', 0.0) < -0.08: reasons.append('material_negative_roi')
+    if len(reasons) >= 2: return {'status': 'DEGRADED', 'risk_multiplier': 0.25, 'reasons': reasons}
+    if reasons: return {'status': 'WATCH', 'risk_multiplier': 0.50, 'reasons': reasons}
     return {'status': 'STABLE', 'risk_multiplier': 1.0, 'reasons': []}
+
+
+def _tier_map(db: Session) -> dict[int, str]:
+    return {int(x.paper_bet_id): x.tier for x in db.scalars(select(BetAudit)).all()}
 
 
 def validation_report(db: Session) -> dict:
     rows = list(db.scalars(select(PaperBet).order_by(PaperBet.placed_at.asc())).all())
+    tiers = _tier_map(db)
+    core_rows = [x for x in rows if tiers.get(x.id, 'LEGACY') != 'EXPLORATION']
+    exploration_rows = [x for x in rows if tiers.get(x.id) == 'EXPLORATION']
     overall = summarize_rows(rows)
+    core = summarize_rows(core_rows)
+    exploration = summarize_rows(exploration_rows)
+
     by_sport_rows = defaultdict(list)
     by_book_rows = defaultdict(list)
     for x in rows:
@@ -119,17 +110,25 @@ def validation_report(db: Session) -> dict:
     by_bookmaker = [dict(key=k, **summarize_rows(v)) for k, v in by_book_rows.items()]
     by_sport.sort(key=lambda x: (-x['n'], x['key']))
     by_bookmaker.sort(key=lambda x: (-x['n'], x['key']))
-    health = strategy_health_from_summary(overall)
+    health = strategy_health_from_summary(core)
     return {
         'overall': overall,
+        'core': core,
+        'exploration': exploration,
         'health': health,
-        'calibration': calibration(rows),
+        'calibration': calibration(core_rows),
+        'exploration_calibration': calibration(exploration_rows),
         'by_sport': by_sport,
         'by_bookmaker': by_bookmaker,
+        'tier_counts': {
+            'core': sum(1 for x in rows if tiers.get(x.id, 'LEGACY') != 'EXPLORATION'),
+            'exploration': sum(1 for x in rows if tiers.get(x.id) == 'EXPLORATION'),
+        },
         'methodology': {
             'min_health_sample': 30,
+            'health_uses': 'CORE only',
             'metrics': ['ROI', 'CLV', 'Brier', 'log-loss', 'max drawdown'],
-            'note': 'Research telemetry only; no metric guarantees future profitability.',
+            'note': 'Exploration bets are tiny paper-only research samples and never weaken CORE acceptance criteria.',
         },
     }
 
