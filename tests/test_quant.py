@@ -1,4 +1,8 @@
-from app.services.quant import remove_vig, expected_value, kelly_fraction, consensus_market
+from app.services.quant import (
+    remove_vig, expected_value, kelly_fraction, consensus_market,
+    market_quality, confidence_score, uncertainty_adjusted_ev,
+    fractional_kelly_stake,
+)
 
 
 def test_remove_vig_sums_one():
@@ -38,3 +42,22 @@ def test_extreme_book_is_filtered_from_best_price():
     c = consensus_market(rows)
     assert c['outlier_books'] >= 1
     assert c['best']['Home']['odds'] < 5.0
+
+
+def test_market_quality_rewards_clean_deep_markets():
+    good = market_quality(10, 0.04, 0.01, 0, 10)
+    poor = market_quality(3, 0.11, 0.05, 1, 4)
+    assert good > poor
+    assert 0 <= good <= 1
+
+
+def test_confidence_scaled_kelly_reduces_stake():
+    high = fractional_kelly_stake(10000, .58, 2.0, .90, .20, .01)
+    low = fractional_kelly_stake(10000, .58, 2.0, .40, .20, .01)
+    assert high > low >= 0
+
+
+def test_adjusted_ev_is_more_conservative_with_noise():
+    raw = expected_value(.58, 2.0)
+    adj = uncertainty_adjusted_ev(.58, 2.0, .55, .04)
+    assert adj < raw
