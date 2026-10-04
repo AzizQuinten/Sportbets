@@ -43,9 +43,13 @@ async function load(){
       ['Results learned',num(m.results)],['Teams rated',num(m.ratings)],['Mature teams',num(m.mature_teams)],['Avg games',Number(m.avg_games_per_team||0).toFixed(1)],
       ['Max model weight',pct(m.max_model_weight)],['Last result',dt(m.last_result_at)],['Status',m.status],['Outliers removed',num(a.market_health?.outlier_quotes_removed||0)]
     ].map(x=>`<div class="engineItem"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
-    document.getElementById('modelLine').textContent=m.status==='LEARNING'
-      ?`Cold-start protection active: market consensus remains dominant until teams accumulate roughly ${m.full_strength_games} matches.`
-      :'Independent Elo/Poisson probabilities now have earned model weight; market consensus remains the anchor.';
+
+    const bootstrap=m.bootstrap||{};
+    if(m.status==='LEARNING'){
+      document.getElementById('modelLine').textContent=`Cold-start protection active. Historical bootstrap: ${bootstrap.enabled?'ON':'OFF'} · ${bootstrap.seasons||0} seasons · public-domain source. Model influence grows only after real completed matches are loaded.`;
+    }else{
+      document.getElementById('modelLine').textContent='Independent Elo/Poisson probabilities have earned model weight; market consensus remains the anchor.';
+    }
 
     const rc=a.reject_counts||{};const total=Object.values(rc).reduce((p,c)=>p+c,0)||1;const entries=Object.entries(rc).sort((x,y)=>y[1]-x[1]);
     document.getElementById('rejects').innerHTML=entries.length?entries.map(([r,c])=>`<div class="rejectRow"><div class="rejectName">${esc(reasonNames[r]||r)}</div><div class="bar"><i style="width:${Math.max(3,c/total*100)}%"></i></div><div class="rejectCount">${c}</div></div>`).join(''):'<div class="muted">No rejection data yet.</div>';
@@ -83,6 +87,16 @@ async function runCycle(){
   try{const j=await getJSON('/api/run-cycle',{method:'POST'});toast(`Scan: ${num(j.snapshots)} prices · ${num(j.signals)} signals · ${num(j.accepted)} accepted · ${num(j.paper_bets)} bets · ${num(j.shadow_picks||0)} shadow`,5000)}
   catch(err){toast(`Scan failed: ${err.message}`,5000)}
   finally{btn.disabled=false;btn.textContent='Run scan';await load()}
+}
+
+async function bootstrapModel(){
+  const btn=document.getElementById('bootstrapBtn');btn.disabled=true;btn.textContent='Loading history…';
+  try{
+    const j=await getJSON('/api/bootstrap-model',{method:'POST'});
+    const detail=j.errors?.length?` · ${j.errors.length} source warning(s)`:'';
+    toast(`Model bootstrap: ${num(j.historical_fetched||0)} historical fetched · ${num(j.new_results||0)} new results learned${detail}`,7000);
+  }catch(err){toast(`Bootstrap failed: ${err.message}`,6000)}
+  finally{btn.disabled=false;btn.textContent='Bootstrap model';await load()}
 }
 
 async function settle(){
