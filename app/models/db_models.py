@@ -72,11 +72,6 @@ class PaperBet(Base):
 
 
 class ScanRun(Base):
-    """Audit record for every real odds scan.
-
-    This lives in its own table so it can be added safely with create_all without
-    requiring an ALTER TABLE migration on the existing production tables.
-    """
     __tablename__ = 'scan_runs'
     id: Mapped[int] = mapped_column(primary_key=True)
     trigger: Mapped[str] = mapped_column(String(20), default='manual', index=True)
@@ -95,3 +90,61 @@ class ScanRun(Base):
     quota_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
     quota_used: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+
+class MatchResult(Base):
+    """Completed fixtures used to train the incremental football model."""
+    __tablename__ = 'match_results'
+    __table_args__ = (UniqueConstraint('event_id', name='uq_match_result_event'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(80), index=True)
+    sport_key: Mapped[str] = mapped_column(String(80), index=True)
+    commence_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    home_team: Mapped[str] = mapped_column(String(160), index=True)
+    away_team: Mapped[str] = mapped_column(String(160), index=True)
+    home_score: Mapped[float] = mapped_column(Float)
+    away_score: Mapped[float] = mapped_column(Float)
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class TeamRating(Base):
+    """Incremental Elo + rolling goal-strength state per competition/team."""
+    __tablename__ = 'team_ratings'
+    __table_args__ = (UniqueConstraint('sport_key', 'team', name='uq_team_rating'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sport_key: Mapped[str] = mapped_column(String(80), index=True)
+    team: Mapped[str] = mapped_column(String(160), index=True)
+    rating: Mapped[float] = mapped_column(Float, default=1500.0)
+    games: Mapped[int] = mapped_column(Integer, default=0)
+    wins: Mapped[int] = mapped_column(Integer, default=0)
+    draws: Mapped[int] = mapped_column(Integer, default=0)
+    losses: Mapped[int] = mapped_column(Integer, default=0)
+    goals_for_ema: Mapped[float] = mapped_column(Float, default=1.35)
+    goals_against_ema: Mapped[float] = mapped_column(Float, default=1.35)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class ShadowPick(Base):
+    """Near-miss candidate tracked with zero bankroll risk for threshold research."""
+    __tablename__ = 'shadow_picks'
+    __table_args__ = (UniqueConstraint('event_id', 'market', 'outcome', name='uq_shadow_pick'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(80), index=True)
+    sport_key: Mapped[str] = mapped_column(String(80), index=True)
+    market: Mapped[str] = mapped_column(String(40))
+    outcome: Mapped[str] = mapped_column(String(160))
+    bookmaker: Mapped[str] = mapped_column(String(80))
+    odds: Mapped[float] = mapped_column(Float)
+    fair_prob: Mapped[float] = mapped_column(Float)
+    model_prob: Mapped[float] = mapped_column(Float)
+    edge: Mapped[float] = mapped_column(Float)
+    ev: Mapped[float] = mapped_column(Float)
+    books: Mapped[int] = mapped_column(Integer)
+    model_reliability: Mapped[float] = mapped_column(Float, default=0.0)
+    placed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    commence_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(20), default='OPEN', index=True)
+    result: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    pnl_units: Mapped[float] = mapped_column(Float, default=0.0)
+    closing_odds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    clv: Mapped[float | None] = mapped_column(Float, nullable=True)

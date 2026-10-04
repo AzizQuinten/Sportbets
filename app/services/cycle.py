@@ -9,12 +9,21 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
-from app.models.db_models import OddsSnapshot, PaperBet, ScanRun, Signal
+from app.models.db_models import OddsSnapshot, PaperBet, ScanRun, ShadowPick, Signal
 from app.providers.odds_api import OddsAPIProvider
-from app.services.engine import ingest_rows, build_signals, place_paper_bets, settle_h2h_from_scores
+from app.services.engine import (
+    ingest_rows,
+    build_signals,
+    place_paper_bets,
+    settle_h2h_from_scores,
+    track_shadow_picks,
+    update_closing_lines,
+)
+from app.services.model import ingest_completed_scores
 
 settings = get_settings()
 _cycle_lock = threading.Lock()
+_model_lock = threading.Lock()
 
 
 def _utcnow() -> datetime:
@@ -42,16 +51,9 @@ def latest_successful_scan(db: Session) -> ScanRun | None:
 
 
 def recommended_scan_interval_minutes(db: Session) -> int:
-    """Choose a scan cadence from time-to-kickoff while protecting small API plans.
-
-    The scheduler wakes every POLL_MINUTES, but a real API call only happens when
-    this adaptive interval has elapsed. A ~500-credit plan is therefore kept near
-    a sustainable three-hour baseline instead of being exhausted in a day.
-    """
+    """Adaptive cadence with a sustainable baseline for small API plans."""
     now = _utcnow()
-    next_kickoff = db.scalar(
-        select(func.min(OddsSnapshot.commence_time)).where(OddsSnapshot.commence_time > now)
-    )
+    next_kickoff = db.scalar(select(func.min(OddsSnapshot.commence_time)).where(OddsSnapshot.commence_time > now))
 
     if next_kickoff is None:
         minutes = 180
@@ -72,9 +74,9 @@ def recommended_scan_interval_minutes(db: Session) -> int:
         if remaining <= settings.api_quota_floor:
             minutes = max(minutes, 720)
         elif remaining < 100:
-            minutes = max(minutes, 360)
+            minutes = max(minutes, 720)
         elif remaining < 250:
-            minutes = max(minutes, 240)
+            minutes = max(minutes, 360)
         elif remaining < 500:
             minutes = max(minutes, 180)
 
@@ -110,7 +112,6 @@ def _cleanup_history(db: Session) -> None:
 
 
 def execute_cycle(db: Session, trigger: str = 'manual') -> dict:
-    """Run one complete odds -> signals -> paper bets cycle with an audit record."""
     if not _cycle_lock.acquire(blocking=False):
         return {'status': 'BUSY', 'detail': 'A scan is already running.'}
 
@@ -123,6 +124,8 @@ def execute_cycle(db: Session, trigger: str = 'manual') -> dict:
     total_rows = 0
     all_signals: list[Signal] = []
     total_bets = 0
+    total_shadow = 0
+    clv_updates = 0
     last_quota = {}
     errors: list[str] = []
 
@@ -137,8 +140,10 @@ def execute_cycle(db: Session, trigger: str = 'manual') -> dict:
                 last_quota = quota or last_quota
                 rows = provider.flatten(events)
                 total_rows += ingest_rows(db, rows)
+                clv_updates += update_closing_lines(db, rows)
                 signals = build_signals(db, rows)
                 all_signals.extend(signals)
+                total_shadow += track_shadow_picks(db, signals)
                 total_bets += place_paper_bets(db, signals)
             except Exception as exc:
                 errors.append(f'{sport}: {type(exc).__name__}: {exc}')
@@ -146,9 +151,7 @@ def execute_cycle(db: Session, trigger: str = 'manual') -> dict:
         reject_counts = Counter()
         for signal in all_signals:
             if not signal.accepted and signal.reject_reason:
-                for reason in signal.reject_reason.split(','):
-                    if reason:
-                        reject_counts[reason] += 1
+                reject_counts.update(x for x in signal.reject_reason.split(',') if x)
 
         accepted = sum(1 for signal in all_signals if signal.accepted)
         finished = _utcnow()
@@ -166,7 +169,6 @@ def execute_cycle(db: Session, trigger: str = 'manual') -> dict:
         scan.error = ' | '.join(errors)[:500] if errors else None
         scan.status = 'SUCCESS' if not errors else ('PARTIAL' if all_signals or total_rows else 'FAILED')
         db.commit()
-
         _cleanup_history(db)
 
         return {
@@ -176,14 +178,12 @@ def execute_cycle(db: Session, trigger: str = 'manual') -> dict:
             'signals': len(all_signals),
             'accepted': accepted,
             'paper_bets': total_bets,
+            'shadow_picks': total_shadow,
+            'clv_updates': clv_updates,
             'reject_counts': dict(reject_counts),
             'top_edge': scan.top_edge,
             'top_ev': scan.top_ev,
-            'quota': {
-                'remaining': scan.quota_remaining,
-                'used': scan.quota_used,
-                'last': last_quota.get('last'),
-            },
+            'quota': {'remaining': scan.quota_remaining, 'used': scan.quota_used, 'last': last_quota.get('last')},
             'errors': errors,
             'duration_ms': scan.duration_ms,
         }
@@ -206,7 +206,6 @@ def execute_cycle(db: Session, trigger: str = 'manual') -> dict:
 
 
 def auto_scan_tick() -> dict:
-    """Cheap scheduler tick. Only calls the odds API when the adaptive cadence is due."""
     with SessionLocal() as db:
         due, reason = should_auto_scan(db)
         if not due:
@@ -214,28 +213,44 @@ def auto_scan_tick() -> dict:
         return execute_cycle(db, trigger='auto')
 
 
+def refresh_model_tick() -> dict:
+    """Collect recent completed scores, learn ratings and settle tracked picks."""
+    if not settings.odds_api_key:
+        return {'status': 'SKIPPED', 'reason': 'missing_api_key'}
+    if not _model_lock.acquire(blocking=False):
+        return {'status': 'BUSY'}
+    try:
+        with SessionLocal() as db:
+            provider = OddsAPIProvider(settings.odds_api_key, settings.odds_region)
+            learned = 0
+            settled = 0
+            errors = []
+            for sport in settings.sports:
+                try:
+                    scores = provider.fetch_scores(sport)
+                    learned += ingest_completed_scores(db, sport, scores)
+                    settled += settle_h2h_from_scores(db, scores)
+                except Exception as exc:
+                    errors.append(f'{sport}: {type(exc).__name__}: {exc}')
+            return {
+                'status': 'SUCCESS' if not errors else 'PARTIAL',
+                'new_results': learned,
+                'settled': settled,
+                'errors': errors,
+            }
+    finally:
+        _model_lock.release()
+
+
 def settle_if_needed() -> dict:
-    """Settle only when an open paper bet is old enough to plausibly be final."""
     if not settings.auto_settle_enabled or not settings.odds_api_key:
         return {'status': 'SKIPPED'}
 
     with SessionLocal() as db:
         cutoff = _utcnow() - timedelta(minutes=120)
-        eligible = db.scalar(
-            select(func.count(PaperBet.id)).where(
-                PaperBet.status == 'OPEN',
-                PaperBet.commence_time <= cutoff,
-            )
-        ) or 0
-        if not eligible:
+        paper_eligible = db.scalar(select(func.count(PaperBet.id)).where(PaperBet.status == 'OPEN', PaperBet.commence_time <= cutoff)) or 0
+        shadow_eligible = db.scalar(select(func.count(ShadowPick.id)).where(ShadowPick.status == 'OPEN', ShadowPick.commence_time <= cutoff)) or 0
+        if not paper_eligible and not shadow_eligible:
             return {'status': 'SKIPPED', 'eligible': 0}
 
-        provider = OddsAPIProvider(settings.odds_api_key, settings.odds_region)
-        total = 0
-        errors = []
-        for sport in settings.sports:
-            try:
-                total += settle_h2h_from_scores(db, provider.fetch_scores(sport))
-            except Exception as exc:
-                errors.append(f'{sport}: {type(exc).__name__}: {exc}')
-        return {'status': 'SUCCESS' if not errors else 'PARTIAL', 'settled': total, 'errors': errors}
+    return refresh_model_tick()

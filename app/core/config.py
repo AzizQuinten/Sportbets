@@ -24,13 +24,25 @@ class Settings(BaseSettings):
     max_odds_age_seconds: int = 600
     poll_minutes: int = 5
 
-    # V1.1 engine controls. The scheduler wakes frequently, but actual API scans
-    # are quota-aware and adaptive so a small API plan is not burned in hours.
+    # V1.1 engine controls.
     auto_scan_enabled: bool = True
     auto_settle_enabled: bool = True
     api_quota_floor: int = 40
     snapshot_retention_days: int = 30
     signal_retention_days: int = 30
+
+    # V1.2 model intelligence. The independent model starts with low influence
+    # and earns more weight only as completed matches accumulate.
+    max_model_weight: float = 0.40
+    elo_home_advantage: float = 55.0
+    elo_k_factor: float = 24.0
+    model_full_strength_games: int = 10
+    model_refresh_hours: int = 12
+
+    # Shadow tier: track plausible near-misses without risking bankroll.
+    shadow_min_bookmakers: int = 3
+    shadow_min_edge: float = 0.005
+    shadow_min_ev: float = 0.005
 
     @property
     def sports(self):

@@ -2,15 +2,16 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.config import get_settings
-from app.models.db_models import Signal, PaperBet, ScanRun
+from app.models.db_models import MatchResult, PaperBet, ScanRun, ShadowPick, Signal, TeamRating
 from app.providers.odds_api import OddsAPIProvider
 from app.services.cycle import execute_cycle, latest_scan, latest_successful_scan, next_scan_due_at, recommended_scan_interval_minutes
 from app.services.engine import settle_h2h_from_scores
+from app.services.model import ingest_completed_scores, model_summary
 
 router = APIRouter()
 settings = get_settings()
@@ -45,9 +46,11 @@ def health(db: Session = Depends(get_db)):
     latest = latest_scan(db)
     return {
         'ok': True,
+        'version': '1.2.0',
         'paper_only': settings.paper_only,
         'auto_scan_enabled': settings.auto_scan_enabled,
         'latest_scan_status': latest.status if latest else None,
+        'model': model_summary(db),
     }
 
 
@@ -68,14 +71,16 @@ def settle(db: Session = Depends(get_db)):
     if not settings.odds_api_key:
         raise HTTPException(400, 'ODDS_API_KEY missing')
     provider = OddsAPIProvider(settings.odds_api_key, settings.odds_region)
-    total = 0
+    total = learned = 0
     errors = []
     for sport in settings.sports:
         try:
-            total += settle_h2h_from_scores(db, provider.fetch_scores(sport))
+            scores = provider.fetch_scores(sport)
+            learned += ingest_completed_scores(db, sport, scores)
+            total += settle_h2h_from_scores(db, scores)
         except Exception as exc:
             errors.append(f'{sport}: {type(exc).__name__}: {exc}')
-    return {'settled': total, 'errors': errors}
+    return {'settled': total, 'new_model_results': learned, 'errors': errors}
 
 
 @router.get('/api/signals')
@@ -120,6 +125,7 @@ def paper_bets(limit: int = 200, db: Session = Depends(get_db)):
         'ev': x.ev,
         'status': x.status,
         'pnl': x.pnl,
+        'closing_odds': x.closing_odds,
         'clv': x.clv,
         'result': x.result,
         'placed_at': x.placed_at,
@@ -134,6 +140,7 @@ def kpis(db: Session = Depends(get_db)):
     pnl = sum(b.pnl for b in settled)
     staked = sum(b.stake for b in settled)
     wins = sum(1 for b in settled if b.result == 'WIN')
+    clvs = [b.clv for b in bets if b.clv is not None]
     latest = latest_successful_scan(db)
     return {
         'bankroll_start': settings.bankroll,
@@ -144,6 +151,7 @@ def kpis(db: Session = Depends(get_db)):
         'settled': len(settled),
         'winrate': wins / len(settled) if settled else 0.0,
         'open_exposure': sum(b.stake for b in bets if b.status == 'OPEN'),
+        'avg_clv': sum(clvs) / len(clvs) if clvs else None,
         'last_scan_prices': latest.snapshots if latest else 0,
         'last_scan_signals': latest.signals if latest else 0,
         'quota_remaining': latest.quota_remaining if latest else None,
@@ -156,6 +164,7 @@ def engine_status(db: Session = Depends(get_db)):
     successful = latest_successful_scan(db)
     due = next_scan_due_at(db)
     return {
+        'version': '1.2.0',
         'auto_scan_enabled': settings.auto_scan_enabled,
         'auto_settle_enabled': settings.auto_settle_enabled,
         'scheduler_tick_minutes': settings.poll_minutes,
@@ -164,6 +173,7 @@ def engine_status(db: Session = Depends(get_db)):
         'quota_floor': settings.api_quota_floor,
         'latest_scan': _scan_dict(latest),
         'latest_successful_scan': _scan_dict(successful),
+        'model': model_summary(db),
         'strategy': {
             'min_bookmakers': settings.min_bookmakers,
             'min_edge': settings.min_edge,
@@ -174,6 +184,9 @@ def engine_status(db: Session = Depends(get_db)):
             'max_event_exposure_pct': settings.max_event_exposure_pct,
             'max_daily_exposure_pct': settings.max_daily_exposure_pct,
             'paper_only': settings.paper_only,
+            'max_model_weight': settings.max_model_weight,
+            'shadow_min_edge': settings.shadow_min_edge,
+            'shadow_min_ev': settings.shadow_min_ev,
         },
     }
 
@@ -195,22 +208,21 @@ def _latest_scan_signals(db: Session):
 def analytics(db: Session = Depends(get_db)):
     run, rows = _latest_scan_signals(db)
     if not run:
-        return {
-            'latest_scan': None,
-            'reject_counts': {},
-            'near_misses': [],
-            'accepted': [],
-            'market_health': {},
-        }
+        return {'latest_scan': None, 'reject_counts': {}, 'near_misses': [], 'accepted': [], 'market_health': {}}
 
     rejects = Counter()
     sport_counts = Counter()
     book_counts = []
     vigs = []
+    outliers = []
+    model_reliabilities = []
     for s in rows:
         sport_counts[s.sport_key] += 1
         book_counts.append(s.books)
         vigs.append(s.market_vig)
+        mm = (s.meta or {}).get('model') or {}
+        model_reliabilities.append(float(mm.get('reliability') or 0.0))
+        outliers.append(int((s.meta or {}).get('outlier_books') or 0))
         if not s.accepted and s.reject_reason:
             rejects.update(x for x in s.reject_reason.split(',') if x)
 
@@ -257,6 +269,8 @@ def analytics(db: Session = Depends(get_db)):
         'market_health': {
             'avg_books': sum(book_counts) / len(book_counts) if book_counts else 0.0,
             'avg_vig': sum(vigs) / len(vigs) if vigs else 0.0,
+            'avg_model_reliability': sum(model_reliabilities) / len(model_reliabilities) if model_reliabilities else 0.0,
+            'outlier_quotes_removed': sum(outliers),
             'sports': dict(sport_counts),
             'signals': len(rows),
             'positive_ev': sum(1 for s in rows if s.ev > 0),
@@ -265,9 +279,57 @@ def analytics(db: Session = Depends(get_db)):
     }
 
 
+@router.get('/api/model-status')
+def model_status(db: Session = Depends(get_db)):
+    summary = model_summary(db)
+    top = db.scalars(select(TeamRating).order_by(TeamRating.games.desc(), TeamRating.rating.desc()).limit(12)).all()
+    summary['teams'] = [{
+        'sport': x.sport_key,
+        'team': x.team,
+        'rating': x.rating,
+        'games': x.games,
+        'gf': x.goals_for_ema,
+        'ga': x.goals_against_ema,
+    } for x in top]
+    return summary
+
+
+@router.get('/api/shadow')
+def shadow(limit: int = 100, db: Session = Depends(get_db)):
+    all_rows = db.scalars(select(ShadowPick)).all()
+    settled = [x for x in all_rows if x.status == 'SETTLED']
+    wins = sum(1 for x in settled if x.result == 'WIN')
+    pnl = sum(x.pnl_units for x in settled)
+    clvs = [x.clv for x in all_rows if x.clv is not None]
+    recent = db.scalars(select(ShadowPick).order_by(ShadowPick.placed_at.desc()).limit(min(limit, 300))).all()
+    return {
+        'total': len(all_rows),
+        'open': sum(1 for x in all_rows if x.status == 'OPEN'),
+        'settled': len(settled),
+        'wins': wins,
+        'winrate': wins / len(settled) if settled else 0.0,
+        'pnl_units': pnl,
+        'roi_units': pnl / len(settled) if settled else 0.0,
+        'avg_clv': sum(clvs) / len(clvs) if clvs else None,
+        'picks': [{
+            'sport': x.sport_key,
+            'outcome': x.outcome,
+            'odds': x.odds,
+            'edge': x.edge,
+            'ev': x.ev,
+            'books': x.books,
+            'model_reliability': x.model_reliability,
+            'status': x.status,
+            'result': x.result,
+            'pnl_units': x.pnl_units,
+            'clv': x.clv,
+            'placed_at': x.placed_at,
+            'commence_time': x.commence_time,
+        } for x in recent],
+    }
+
+
 @router.get('/api/scan-history')
 def scan_history(limit: int = 20, db: Session = Depends(get_db)):
-    rows = db.scalars(
-        select(ScanRun).order_by(ScanRun.started_at.desc()).limit(min(limit, 100))
-    ).all()
+    rows = db.scalars(select(ScanRun).order_by(ScanRun.started_at.desc()).limit(min(limit, 100))).all()
     return [_scan_dict(x) for x in rows]
