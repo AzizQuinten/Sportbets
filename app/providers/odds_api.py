@@ -35,13 +35,13 @@ class OddsAPIProvider:
         except (TypeError, ValueError, OverflowError):
             return None
 
-    def _get(self, url: str, params: dict):
+    def _get(self, url: str, params: dict, allow_statuses=()):
         r = requests.get(url, params=params, timeout=self.timeout)
-        quota = {
-            'remaining': r.headers.get('x-requests-remaining'),
-            'used': r.headers.get('x-requests-used'),
-            'last': r.headers.get('x-requests-last'),
-        }
+        quota = {'remaining': r.headers.get('x-requests-remaining'), 'used': r.headers.get('x-requests-used'), 'last': r.headers.get('x-requests-last')}
+        if r.status_code in allow_statuses:
+            try: payload = r.json()
+            except ValueError: payload = None
+            return r, payload, quota
         try:
             r.raise_for_status()
         except requests.HTTPError as exc:
@@ -52,159 +52,82 @@ class OddsAPIProvider:
             raise RuntimeError(f'Odds API returned non-JSON HTTP {r.status_code}') from exc
 
     def fetch_active_sports(self):
-        """Return the FULL supported soccer catalogue.
-
-        Critical: /sports without all=true only returns in-season/recently updated
-        competitions. That silently hid valid leagues from fixture discovery. The
-        catalogue endpoint is quota-free, so discover every soccer key and let the
-        quota-free /events preflight decide which leagues actually have a fixture
-        today/tomorrow.
-        """
-        _, payload, _ = self._get(
-            f'{self.BASE}/sports/',
-            {'apiKey': self.api_key, 'all': 'true'},
-        )
+        _, payload, _ = self._get(f'{self.BASE}/sports/', {'apiKey': self.api_key, 'all': 'true'})
         if not isinstance(payload, list):
             raise RuntimeError(f'Unexpected sports payload: {type(payload).__name__}')
-        return [
-            x for x in payload
-            if (str(x.get('key', '')).startswith('soccer_') or str(x.get('group', '')).lower().startswith('soccer'))
-            and not x.get('has_outrights', False)
-        ]
+        return [x for x in payload if (str(x.get('key', '')).startswith('soccer_') or str(x.get('group', '')).lower().startswith('soccer')) and not x.get('has_outrights', False)]
 
     def fetch_events(self, sport_key: str):
-        """Quota-free fixture preflight, hard limited to Amsterdam today+tomorrow."""
         window_start, window_end = self._scan_window()
-        r, payload, _ = self._get(
-            f'{self.BASE}/sports/{sport_key}/events',
-            {
-                'apiKey': self.api_key,
-                'dateFormat': 'iso',
-                'commenceTimeFrom': self._iso_utc(window_start),
-                'commenceTimeTo': self._iso_utc(window_end),
-            },
-        )
+        r, payload, _ = self._get(f'{self.BASE}/sports/{sport_key}/events', {'apiKey': self.api_key, 'dateFormat': 'iso', 'commenceTimeFrom': self._iso_utc(window_start), 'commenceTimeTo': self._iso_utc(window_end)}, allow_statuses=(404,))
+        # all=true includes out-of-season/tier-unavailable catalogue keys. A 404 here
+        # means this league is not currently queryable; it is not a scan-fatal error.
+        if r.status_code == 404:
+            return [], {'http_status': 404, 'raw_events': 0, 'eligible_events': 0, 'past_events': 0, 'beyond_window': 0, 'invalid_times': 0, 'unavailable': True, 'window_from': self._iso_utc(window_start), 'window_to': self._iso_utc(window_end)}
         if not isinstance(payload, list):
             raise RuntimeError(f'Unexpected events payload for {sport_key}: {type(payload).__name__}')
-        eligible = []
-        past = future = invalid = 0
+        eligible=[]; past=future=invalid=0
         for event in payload:
-            commence = self._parse_time(event.get('commence_time'))
-            if commence is None:
-                invalid += 1
-            elif commence < window_start:
-                past += 1
-            elif commence > window_end:
-                future += 1
-            else:
-                eligible.append(event)
-        return eligible, {
-            'http_status': r.status_code,
-            'raw_events': len(payload),
-            'eligible_events': len(eligible),
-            'past_events': past,
-            'beyond_window': future,
-            'invalid_times': invalid,
-            'window_from': self._iso_utc(window_start),
-            'window_to': self._iso_utc(window_end),
-        }
+            commence=self._parse_time(event.get('commence_time'))
+            if commence is None: invalid+=1
+            elif commence < window_start: past+=1
+            elif commence > window_end: future+=1
+            else: eligible.append(event)
+        return eligible, {'http_status':r.status_code,'raw_events':len(payload),'eligible_events':len(eligible),'past_events':past,'beyond_window':future,'invalid_times':invalid,'window_from':self._iso_utc(window_start),'window_to':self._iso_utc(window_end)}
 
     def fetch_odds(self, sport_key: str, markets: list[str]):
-        window_start, window_end = self._scan_window()
-        url = f'{self.BASE}/sports/{sport_key}/odds/'
-        params = {
-            'apiKey': self.api_key,
-            'regions': self.region,
-            'markets': ','.join(markets),
-            'oddsFormat': 'decimal',
-            'dateFormat': 'iso',
-            'commenceTimeFrom': self._iso_utc(window_start),
-            'commenceTimeTo': self._iso_utc(window_end),
-        }
-        r, payload, quota = self._get(url, params)
-        if not isinstance(payload, list):
-            raise RuntimeError(f'Unexpected odds payload for {sport_key}: {type(payload).__name__}')
-
-        filtered = []
-        invalid_times = past_events = beyond_window = 0
-        raw_books = raw_markets = raw_outcomes = 0
+        window_start, window_end=self._scan_window()
+        params={'apiKey':self.api_key,'regions':self.region,'markets':','.join(markets),'oddsFormat':'decimal','dateFormat':'iso','commenceTimeFrom':self._iso_utc(window_start),'commenceTimeTo':self._iso_utc(window_end)}
+        r,payload,quota=self._get(f'{self.BASE}/sports/{sport_key}/odds/',params)
+        if not isinstance(payload,list): raise RuntimeError(f'Unexpected odds payload for {sport_key}: {type(payload).__name__}')
+        filtered=[]; invalid_times=past_events=beyond_window=raw_books=raw_markets=raw_outcomes=0
         for event in payload:
-            books = event.get('bookmakers') or []
-            raw_books += len(books)
+            books=event.get('bookmakers') or []; raw_books+=len(books)
             for book in books:
-                mkts = book.get('markets') or []
-                raw_markets += len(mkts)
-                for market in mkts:
-                    raw_outcomes += len(market.get('outcomes') or [])
-            commence = self._parse_time(event.get('commence_time'))
-            if commence is None:
-                invalid_times += 1
-            elif commence < window_start:
-                past_events += 1
-            elif commence > window_end:
-                beyond_window += 1
-            else:
-                filtered.append(event)
+                mkts=book.get('markets') or []; raw_markets+=len(mkts)
+                for market in mkts: raw_outcomes+=len(market.get('outcomes') or [])
+            commence=self._parse_time(event.get('commence_time'))
+            if commence is None: invalid_times+=1
+            elif commence < window_start: past_events+=1
+            elif commence > window_end: beyond_window+=1
+            else: filtered.append(event)
+        eligible_books=sum(len(e.get('bookmakers') or []) for e in filtered)
+        eligible_markets=sum(len(b.get('markets') or []) for e in filtered for b in (e.get('bookmakers') or []))
+        eligible_outcomes=sum(len(m.get('outcomes') or []) for e in filtered for b in (e.get('bookmakers') or []) for m in (b.get('markets') or []))
+        meta={'sport_key':sport_key,'http_status':r.status_code,'raw_events':len(payload),'eligible_events':len(filtered),'past_events':past_events,'beyond_window':beyond_window,'invalid_times':invalid_times,'raw_bookmakers':raw_books,'raw_markets':raw_markets,'raw_outcomes':raw_outcomes,'eligible_bookmakers':eligible_books,'eligible_markets':eligible_markets,'eligible_outcomes':eligible_outcomes,'window_from':self._iso_utc(window_start),'window_to':self._iso_utc(window_end)}
+        self.last_fetch_meta=meta
+        return filtered,{**quota,**meta}
 
-        eligible_books = sum(len(e.get('bookmakers') or []) for e in filtered)
-        eligible_markets = sum(len(b.get('markets') or []) for e in filtered for b in (e.get('bookmakers') or []))
-        eligible_outcomes = sum(len(m.get('outcomes') or []) for e in filtered for b in (e.get('bookmakers') or []) for m in (b.get('markets') or []))
-        meta = {
-            'sport_key': sport_key, 'http_status': r.status_code,
-            'raw_events': len(payload), 'eligible_events': len(filtered),
-            'past_events': past_events, 'beyond_window': beyond_window,
-            'invalid_times': invalid_times, 'raw_bookmakers': raw_books,
-            'raw_markets': raw_markets, 'raw_outcomes': raw_outcomes,
-            'eligible_bookmakers': eligible_books, 'eligible_markets': eligible_markets,
-            'eligible_outcomes': eligible_outcomes,
-            'window_from': self._iso_utc(window_start), 'window_to': self._iso_utc(window_end),
-        }
-        self.last_fetch_meta = meta
-        return filtered, {**quota, **meta}
+    def fetch_scores(self,sport_key:str,days_from:int=3):
+        _,payload,_=self._get(f'{self.BASE}/sports/{sport_key}/scores/',{'apiKey':self.api_key,'daysFrom':max(1,min(3,int(days_from))),'dateFormat':'iso'})
+        return payload if isinstance(payload,list) else []
 
-    def fetch_scores(self, sport_key: str, days_from: int = 3):
-        _, payload, _ = self._get(
-            f'{self.BASE}/sports/{sport_key}/scores/',
-            {'apiKey': self.api_key, 'daysFrom': max(1, min(3, int(days_from))), 'dateFormat': 'iso'},
-        )
-        return payload if isinstance(payload, list) else []
-
-    def fetch_score_history(self, sport_key: str, windows: int = 1):
-        merged = {}
-        for _ in range(max(1, windows)):
-            for event in self.fetch_scores(sport_key, days_from=3):
-                if event.get('id'):
-                    merged[event['id']] = event
+    def fetch_score_history(self,sport_key:str,windows:int=1):
+        merged={}
+        for _ in range(max(1,windows)):
+            for event in self.fetch_scores(sport_key,days_from=3):
+                if event.get('id'): merged[event['id']]=event
             break
         return list(merged.values())
 
     @staticmethod
-    def flatten(events: list[dict]):
-        now = datetime.now(timezone.utc)
-        rows = []
+    def flatten(events:list[dict]):
+        now=datetime.now(timezone.utc); rows=[]
         for event in events:
-            commence = OddsAPIProvider._parse_time(event.get('commence_time'))
-            if commence is None:
-                continue
-            event_id, sport_key = event.get('id'), event.get('sport_key')
-            home, away = event.get('home_team'), event.get('away_team')
-            if not all((event_id, sport_key, home, away)):
-                continue
+            commence=OddsAPIProvider._parse_time(event.get('commence_time'))
+            if commence is None: continue
+            event_id,sport_key=event.get('id'),event.get('sport_key'); home,away=event.get('home_team'),event.get('away_team')
+            if not all((event_id,sport_key,home,away)): continue
             for book in event.get('bookmakers') or []:
-                book_key = book.get('key')
-                if not book_key:
-                    continue
+                book_key=book.get('key')
+                if not book_key: continue
                 for market in book.get('markets') or []:
-                    market_key = market.get('key')
-                    if not market_key:
-                        continue
+                    market_key=market.get('key')
+                    if not market_key: continue
                     for out in market.get('outcomes') or []:
-                        try:
-                            price = float(out['price'])
-                        except (KeyError, TypeError, ValueError):
-                            continue
-                        outcome = out.get('name')
-                        if not outcome or price <= 1.0:
-                            continue
-                        rows.append({'event_id': event_id, 'sport_key': sport_key, 'commence_time': commence, 'home_team': home, 'away_team': away, 'market': market_key, 'bookmaker': book_key, 'outcome': outcome, 'price': price, 'point': out.get('point'), 'observed_at': now})
+                        try: price=float(out['price'])
+                        except (KeyError,TypeError,ValueError): continue
+                        outcome=out.get('name')
+                        if not outcome or price<=1.0: continue
+                        rows.append({'event_id':event_id,'sport_key':sport_key,'commence_time':commence,'home_team':home,'away_team':away,'market':market_key,'bookmaker':book_key,'outcome':outcome,'price':price,'point':out.get('point'),'observed_at':now})
         return rows
