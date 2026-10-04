@@ -69,3 +69,29 @@ class PaperBet(Base):
     closing_odds: Mapped[float | None] = mapped_column(Float, nullable=True)
     clv: Mapped[float | None] = mapped_column(Float, nullable=True)
     result: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+
+class ScanRun(Base):
+    """Audit record for every real odds scan.
+
+    This lives in its own table so it can be added safely with create_all without
+    requiring an ALTER TABLE migration on the existing production tables.
+    """
+    __tablename__ = 'scan_runs'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trigger: Mapped[str] = mapped_column(String(20), default='manual', index=True)
+    status: Mapped[str] = mapped_column(String(20), default='RUNNING', index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    sports: Mapped[int] = mapped_column(Integer, default=0)
+    snapshots: Mapped[int] = mapped_column(Integer, default=0)
+    signals: Mapped[int] = mapped_column(Integer, default=0)
+    accepted: Mapped[int] = mapped_column(Integer, default=0)
+    paper_bets: Mapped[int] = mapped_column(Integer, default=0)
+    reject_counts: Mapped[dict] = mapped_column(JSON, default=dict)
+    top_edge: Mapped[float | None] = mapped_column(Float, nullable=True)
+    top_ev: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quota_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quota_used: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
