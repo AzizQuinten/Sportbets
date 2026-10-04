@@ -1,21 +1,51 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import requests
 
 
 class OddsAPIProvider:
     BASE = 'https://api.the-odds-api.com/v4'
+    SCAN_TZ = ZoneInfo('Europe/Amsterdam')
 
     def __init__(self, api_key: str, region: str = 'eu', timeout: int = 20):
         self.api_key = api_key
         self.region = region
         self.timeout = timeout
 
+    @classmethod
+    def _scan_window_utc(cls):
+        """Return the UTC window covering today + tomorrow in Dutch local time.
+
+        This keeps the betting engine focused on actionable fixtures and prevents
+        next-week matches from entering signal generation, shadow research or the
+        paper ledger. DST is handled by Europe/Amsterdam automatically.
+        """
+        now_local = datetime.now(cls.SCAN_TZ)
+        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_local = start_local + timedelta(days=2)
+        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
     def fetch_odds(self, sport_key: str, markets: list[str]):
         url = f'{self.BASE}/sports/{sport_key}/odds'
-        params = {'apiKey': self.api_key, 'regions': self.region, 'markets': ','.join(markets), 'oddsFormat': 'decimal', 'dateFormat': 'iso'}
+        start_utc, end_utc = self._scan_window_utc()
+        params = {
+            'apiKey': self.api_key,
+            'regions': self.region,
+            'markets': ','.join(markets),
+            'oddsFormat': 'decimal',
+            'dateFormat': 'iso',
+            'commenceTimeFrom': start_utc.isoformat().replace('+00:00', 'Z'),
+            # The API upper bound is inclusive, so subtract a microsecond to keep
+            # fixtures at 00:00 the day after tomorrow out of the scan.
+            'commenceTimeTo': (end_utc - timedelta(microseconds=1)).isoformat().replace('+00:00', 'Z'),
+        }
         r = requests.get(url, params=params, timeout=self.timeout)
         r.raise_for_status()
-        return r.json(), {'remaining': r.headers.get('x-requests-remaining'), 'used': r.headers.get('x-requests-used'), 'last': r.headers.get('x-requests-last')}
+        return r.json(), {
+            'remaining': r.headers.get('x-requests-remaining'),
+            'used': r.headers.get('x-requests-used'),
+            'last': r.headers.get('x-requests-last'),
+        }
 
     def fetch_scores(self, sport_key: str, days_from: int = 3):
         url = f'{self.BASE}/sports/{sport_key}/scores'
