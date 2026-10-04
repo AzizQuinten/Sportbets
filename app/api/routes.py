@@ -2,19 +2,27 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.config import get_settings
-from app.models.db_models import MatchResult, PaperBet, ScanRun, ShadowPick, Signal, TeamRating
+from app.models.db_models import PaperBet, ScanRun, ShadowPick, Signal, TeamRating
 from app.providers.odds_api import OddsAPIProvider
-from app.services.cycle import execute_cycle, latest_scan, latest_successful_scan, next_scan_due_at, recommended_scan_interval_minutes
+from app.services.cycle import (
+    bootstrap_model_tick,
+    execute_cycle,
+    latest_scan,
+    latest_successful_scan,
+    next_scan_due_at,
+    recommended_scan_interval_minutes,
+)
 from app.services.engine import settle_h2h_from_scores
 from app.services.model import ingest_completed_scores, model_summary
 
 router = APIRouter()
 settings = get_settings()
+APP_VERSION = '1.4.0'
 
 
 def _scan_dict(x: ScanRun | None):
@@ -46,9 +54,10 @@ def health(db: Session = Depends(get_db)):
     latest = latest_scan(db)
     return {
         'ok': True,
-        'version': '1.2.0',
+        'version': APP_VERSION,
         'paper_only': settings.paper_only,
         'auto_scan_enabled': settings.auto_scan_enabled,
+        'historical_bootstrap_enabled': settings.historical_bootstrap_enabled,
         'latest_scan_status': latest.status if latest else None,
         'model': model_summary(db),
     }
@@ -66,6 +75,14 @@ def run_cycle(db: Session = Depends(get_db)):
     return result
 
 
+@router.post('/api/bootstrap-model')
+def bootstrap_model():
+    result = bootstrap_model_tick()
+    if result.get('status') == 'BUSY':
+        raise HTTPException(409, 'Model bootstrap already running')
+    return result
+
+
 @router.post('/api/settle')
 def settle(db: Session = Depends(get_db)):
     if not settings.odds_api_key:
@@ -75,7 +92,7 @@ def settle(db: Session = Depends(get_db)):
     errors = []
     for sport in settings.sports:
         try:
-            scores = provider.fetch_scores(sport)
+            scores = provider.fetch_scores(sport, days_from=3)
             learned += ingest_completed_scores(db, sport, scores)
             total += settle_h2h_from_scores(db, scores)
         except Exception as exc:
@@ -164,9 +181,11 @@ def engine_status(db: Session = Depends(get_db)):
     successful = latest_successful_scan(db)
     due = next_scan_due_at(db)
     return {
-        'version': '1.2.0',
+        'version': APP_VERSION,
         'auto_scan_enabled': settings.auto_scan_enabled,
         'auto_settle_enabled': settings.auto_settle_enabled,
+        'historical_bootstrap_enabled': settings.historical_bootstrap_enabled,
+        'historical_bootstrap_seasons': settings.historical_bootstrap_seasons,
         'scheduler_tick_minutes': settings.poll_minutes,
         'recommended_scan_interval_minutes': recommended_scan_interval_minutes(db),
         'next_scan_due_at': due,
@@ -283,6 +302,12 @@ def analytics(db: Session = Depends(get_db)):
 def model_status(db: Session = Depends(get_db)):
     summary = model_summary(db)
     top = db.scalars(select(TeamRating).order_by(TeamRating.games.desc(), TeamRating.rating.desc()).limit(12)).all()
+    summary['bootstrap'] = {
+        'enabled': settings.historical_bootstrap_enabled,
+        'seasons': settings.historical_bootstrap_seasons,
+        'supported_sports': ['soccer_epl'],
+        'source': 'openfootball_public_domain',
+    }
     summary['teams'] = [{
         'sport': x.sport_key,
         'team': x.team,
