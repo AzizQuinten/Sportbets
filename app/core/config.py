@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     bankroll: float = 10000.0
     paper_only: bool = True
 
-    # Core paper-bet gate: deliberately selective.
+    # CORE: deliberately selective and never relaxed just to force action.
     min_bookmakers: int = 4
     min_edge: float = 0.035
     min_ev: float = 0.025
@@ -36,9 +36,7 @@ class Settings(BaseSettings):
     max_odds_age_seconds: int = 600
     poll_minutes: int = 5
 
-    # V2.2 controlled exploration tier. This is PAPER ONLY and exists to build
-    # statistically useful evidence without weakening the production-grade core
-    # gate. It samples only high-quality near misses with tiny capped stakes.
+    # EXPLORATION: model-led near misses with tiny paper stakes.
     exploration_enabled: bool = True
     exploration_max_bets_per_scan: int = 3
     exploration_min_bookmakers: int = 3
@@ -48,6 +46,20 @@ class Settings(BaseSettings):
     exploration_min_confidence: float = 0.55
     exploration_max_stake_pct: float = 0.0015
     exploration_max_daily_exposure_pct: float = 0.006
+
+    # SCOUT: independent market-price research. Uses the no-vig consensus as the
+    # probability anchor, not an immature model. It exists so active slates can
+    # generate small, auditable paper observations without weakening CORE.
+    scout_enabled: bool = True
+    scout_max_bets_per_scan: int = 2
+    scout_min_bookmakers: int = 2
+    scout_min_market_edge: float = 0.0005
+    scout_min_market_ev: float = 0.0010
+    scout_min_market_quality: float = 0.45
+    scout_min_odds: float = 1.25
+    scout_max_odds: float = 7.00
+    scout_max_stake_pct: float = 0.0005
+    scout_max_daily_exposure_pct: float = 0.002
 
     auto_scan_enabled: bool = True
     auto_settle_enabled: bool = True
