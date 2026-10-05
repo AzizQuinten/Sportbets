@@ -95,11 +95,13 @@ def _tier_map(db: Session) -> dict[int, str]:
 def validation_report(db: Session) -> dict:
     rows = list(db.scalars(select(PaperBet).order_by(PaperBet.placed_at.asc())).all())
     tiers = _tier_map(db)
-    core_rows = [x for x in rows if tiers.get(x.id, 'LEGACY') != 'EXPLORATION']
+    core_rows = [x for x in rows if tiers.get(x.id, 'LEGACY') in ('CORE', 'LEGACY')]
     exploration_rows = [x for x in rows if tiers.get(x.id) == 'EXPLORATION']
+    scout_rows = [x for x in rows if tiers.get(x.id) == 'SCOUT']
     overall = summarize_rows(rows)
     core = summarize_rows(core_rows)
     exploration = summarize_rows(exploration_rows)
+    scout = summarize_rows(scout_rows)
 
     by_sport_rows = defaultdict(list)
     by_book_rows = defaultdict(list)
@@ -115,20 +117,23 @@ def validation_report(db: Session) -> dict:
         'overall': overall,
         'core': core,
         'exploration': exploration,
+        'scout': scout,
         'health': health,
         'calibration': calibration(core_rows),
         'exploration_calibration': calibration(exploration_rows),
+        'scout_calibration': calibration(scout_rows),
         'by_sport': by_sport,
         'by_bookmaker': by_bookmaker,
         'tier_counts': {
-            'core': sum(1 for x in rows if tiers.get(x.id, 'LEGACY') != 'EXPLORATION'),
+            'core': sum(1 for x in rows if tiers.get(x.id, 'LEGACY') in ('CORE', 'LEGACY')),
             'exploration': sum(1 for x in rows if tiers.get(x.id) == 'EXPLORATION'),
+            'scout': sum(1 for x in rows if tiers.get(x.id) == 'SCOUT'),
         },
         'methodology': {
             'min_health_sample': 30,
             'health_uses': 'CORE only',
             'metrics': ['ROI', 'CLV', 'Brier', 'log-loss', 'max drawdown'],
-            'note': 'Exploration bets are tiny paper-only research samples and never weaken CORE acceptance criteria.',
+            'note': 'EXPLORATION and SCOUT are tiny paper-only research tiers. They never weaken CORE acceptance or drive CORE risk.',
         },
     }
 
