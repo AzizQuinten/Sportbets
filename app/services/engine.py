@@ -57,8 +57,11 @@ def build_signals(db: Session, rows: list[dict]) -> list[Signal]:
             best = con['best'].get(outcome)
             if not best:
                 continue
+            implied_best = 1.0 / best['odds']
+            market_edge = fair_prob - implied_best
+            market_ev = expected_value(fair_prob, best['odds'])
             model_prob, model_meta = external_probability(db, meta, outcome, fair_prob)
-            edge = model_prob - (1.0 / best['odds'])
+            edge = model_prob - implied_best
             ev = expected_value(model_prob, best['odds'])
             disp = con['dispersion'].get(outcome, 0.0)
             reliability = float(model_meta.get('reliability') or 0.0)
@@ -89,7 +92,7 @@ def build_signals(db: Session, rows: list[dict]) -> list[Signal]:
                     'commence_time': meta['commence_time'].isoformat(), 'point': point,
                     'model': model_meta, 'raw_books': con.get('raw_books', con['books']),
                     'outlier_books': con.get('outlier_books', 0), 'market_quality': quality,
-                    'adjusted_ev': adj_ev,
+                    'adjusted_ev': adj_ev, 'market_edge': market_edge, 'market_ev': market_ev,
                     'effective_gates': {'books': min_books, 'edge': min_edge, 'ev': min_ev},
                 },
             )
@@ -112,6 +115,15 @@ def _selection_score(s: Signal) -> float:
     return 0.45 * q + 0.30 * float(s.confidence or 0.0) + 0.25 * max(0.0, min(1.0, ae / 0.08))
 
 
+def _scout_score(s: Signal) -> float:
+    meta = s.meta or {}
+    q = float(meta.get('market_quality') or 0.0)
+    me = max(0.0, float(meta.get('market_edge') or 0.0))
+    mev = max(0.0, float(meta.get('market_ev') or 0.0))
+    breadth = min(1.0, float(s.books or 0) / 8.0)
+    return 0.45 * q + 0.20 * breadth + 0.20 * min(1.0, me / 0.02) + 0.15 * min(1.0, mev / 0.04)
+
+
 def _write_bet(db: Session, s: Signal, stake: float, tier: str) -> bool:
     meta = s.meta or {}
     bet = PaperBet(
@@ -123,12 +135,12 @@ def _write_bet(db: Session, s: Signal, stake: float, tier: str) -> bool:
     db.add(bet)
     try:
         db.flush()
+        score = _scout_score(s) if tier == 'SCOUT' else _selection_score(s)
+        audit_ev = float(meta.get('market_ev') or 0.0) if tier == 'SCOUT' else float(meta.get('adjusted_ev') if meta.get('adjusted_ev') is not None else s.ev)
         db.add(BetAudit(
-            paper_bet_id=bet.id, tier=tier, selection_score=_selection_score(s),
-            adjusted_ev=float(meta.get('adjusted_ev') if meta.get('adjusted_ev') is not None else s.ev),
-            market_quality=float(meta.get('market_quality') or 0.0),
-            confidence=float(s.confidence or 0.0),
-            reject_snapshot=s.reject_reason,
+            paper_bet_id=bet.id, tier=tier, selection_score=score,
+            adjusted_ev=audit_ev, market_quality=float(meta.get('market_quality') or 0.0),
+            confidence=float(s.confidence or 0.0), reject_snapshot=s.reject_reason,
         ))
         db.commit()
         return True
@@ -143,20 +155,36 @@ def _exploration_eligible(s: Signal) -> bool:
     meta = s.meta or {}
     quality = float(meta.get('market_quality') or 0.0)
     adjusted = float(meta.get('adjusted_ev') if meta.get('adjusted_ev') is not None else s.ev)
-    if s.books < settings.exploration_min_bookmakers:
-        return False
-    if s.edge < settings.exploration_min_edge or s.ev < settings.exploration_min_ev:
-        return False
-    if quality < settings.exploration_min_market_quality or s.confidence < settings.exploration_min_confidence:
-        return False
-    if adjusted <= 0:
-        return False
+    if s.books < settings.exploration_min_bookmakers: return False
+    if s.edge < settings.exploration_min_edge or s.ev < settings.exploration_min_ev: return False
+    if quality < settings.exploration_min_market_quality or s.confidence < settings.exploration_min_confidence: return False
+    if adjusted <= 0: return False
     reasons = set((s.reject_reason or '').split(',')) - {''}
-    # Exploration may relax only the core breadth/edge/EV gates. It never
-    # bypasses timing, bad vig, weak market quality, low confidence, model
-    # disagreement/maturity or extreme-EV guardrails.
     allowed = {'too_few_books', 'edge_below_threshold', 'ev_below_threshold'}
     return not (reasons - allowed)
+
+
+def _scout_eligible(s: Signal) -> bool:
+    """Market-price research independent of model maturity.
+
+    SCOUT never claims the model found an edge. It asks a narrower question:
+    is the best available price better than the robust no-vig bookmaker
+    consensus by a positive amount, in a sufficiently clean market?
+    """
+    if s.accepted or s.market != 'h2h':
+        return False
+    meta = s.meta or {}
+    if datetime.fromisoformat(meta['commence_time']) <= datetime.now(timezone.utc):
+        return False
+    quality = float(meta.get('market_quality') or 0.0)
+    market_edge = float(meta.get('market_edge') or 0.0)
+    market_ev = float(meta.get('market_ev') or 0.0)
+    if s.books < settings.scout_min_bookmakers: return False
+    if quality < settings.scout_min_market_quality: return False
+    if market_edge < settings.scout_min_market_edge or market_ev < settings.scout_min_market_ev: return False
+    if s.market_vig > settings.max_vig: return False
+    if not (settings.scout_min_odds <= float(s.best_odds) <= settings.scout_max_odds): return False
+    return True
 
 
 def place_paper_bets(db: Session, signals: list[Signal]) -> int:
@@ -178,11 +206,9 @@ def place_paper_bets(db: Session, signals: list[Signal]) -> int:
         core = filtered
 
     for s in core:
-        if _already_bet(db, s):
-            continue
+        if _already_bet(db, s): continue
         day = _today_exposure(db)
-        if day >= daily_cap:
-            break
+        if day >= daily_cap: break
         remaining_event = max(0.0, event_cap - _event_exposure(db, s.event_id))
         remaining_day = max(0.0, daily_cap - day)
         base = fractional_kelly_stake(settings.bankroll, s.model_prob, s.best_odds, s.confidence, settings.kelly_fraction, settings.max_stake_pct)
@@ -190,31 +216,42 @@ def place_paper_bets(db: Session, signals: list[Signal]) -> int:
         if stake >= 1.0 and _write_bet(db, s, stake, 'CORE'):
             count += 1
 
-    # Controlled research sampling: produces real paper-ledger observations while
-    # keeping the strict CORE gate untouched. A scan can have 0 core bets and
-    # still gather a few high-quality near-miss observations for validation.
+    # Model-led near-miss research.
     if settings.paper_only and settings.exploration_enabled:
-        slots = max(0, int(settings.exploration_max_bets_per_scan) - count)
+        slots = max(0, int(settings.exploration_max_bets_per_scan))
         exploration_daily_cap = settings.bankroll * settings.exploration_max_daily_exposure_pct
         candidates = sorted((s for s in signals if _exploration_eligible(s)), key=rank, reverse=True)
         used_events = set()
         for s in candidates:
-            if slots <= 0:
-                break
+            if slots <= 0: break
             key = (s.event_id, s.market)
-            if key in used_events or _already_bet(db, s):
-                continue
-            if _today_exposure(db) >= daily_cap or _today_tier_exposure(db, 'EXPLORATION') >= exploration_daily_cap:
-                break
+            if key in used_events or _already_bet(db, s): continue
+            if _today_exposure(db) >= daily_cap or _today_tier_exposure(db, 'EXPLORATION') >= exploration_daily_cap: break
             remaining_event = max(0.0, event_cap - _event_exposure(db, s.event_id))
             remaining_day = max(0.0, daily_cap - _today_exposure(db))
             remaining_explore = max(0.0, exploration_daily_cap - _today_tier_exposure(db, 'EXPLORATION'))
-            # Fixed tiny cap for research samples; confidence affects ranking, not
-            # an exaggerated Kelly stake on a signal that did not clear CORE.
             stake = min(settings.bankroll * settings.exploration_max_stake_pct * health_mult, remaining_event, remaining_day, remaining_explore)
-            if stake < 1.0:
-                continue
-            if _write_bet(db, s, stake, 'EXPLORATION'):
+            if stake >= 1.0 and _write_bet(db, s, stake, 'EXPLORATION'):
+                count += 1; slots -= 1; used_events.add(key)
+
+    # Market-consensus SCOUT. This solves the data-starvation problem without
+    # pretending weak model signals are CORE. It is deliberately tiny and paper
+    # only, and is evaluated separately from CORE performance.
+    if settings.paper_only and settings.scout_enabled:
+        slots = max(0, int(settings.scout_max_bets_per_scan))
+        scout_daily_cap = settings.bankroll * settings.scout_max_daily_exposure_pct
+        candidates = sorted((s for s in signals if _scout_eligible(s)), key=_scout_score, reverse=True)
+        used_events = set()
+        for s in candidates:
+            if slots <= 0: break
+            key = (s.event_id, s.market)
+            if key in used_events or _already_bet(db, s): continue
+            if _today_exposure(db) >= daily_cap or _today_tier_exposure(db, 'SCOUT') >= scout_daily_cap: break
+            remaining_event = max(0.0, event_cap - _event_exposure(db, s.event_id))
+            remaining_day = max(0.0, daily_cap - _today_exposure(db))
+            remaining_scout = max(0.0, scout_daily_cap - _today_tier_exposure(db, 'SCOUT'))
+            stake = min(settings.bankroll * settings.scout_max_stake_pct, remaining_event, remaining_day, remaining_scout)
+            if stake >= 1.0 and _write_bet(db, s, stake, 'SCOUT'):
                 count += 1; slots -= 1; used_events.add(key)
     return count
 
